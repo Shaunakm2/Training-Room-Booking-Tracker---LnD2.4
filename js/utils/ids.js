@@ -49,3 +49,23 @@ export function creationMs(id) {
   if (ms < EARLIEST_PLAUSIBLE_MS) return -1; // decoded before this app existed
   return ms;
 }
+
+// Single definition of "when was this booking created", used by the initial
+// sort in api/supabase-client.js and by the "Recently Added" sort in
+// domain/filters-sort.js. Two slightly different rules is how those two
+// disagreed in the first place.
+//
+// Prefers the created_at column (mapped to createdAtMs); falls back to
+// decoding the id. created_at is NULLABLE by design — rows predating the
+// column have no recoverable creation time — and is NOT fully backfilled, so
+// the fallback is load-bearing, not defensive padding.
+//
+// Returns ms, or -1 for "unknown" so those rows sort as oldest. That is
+// honest: their creation time genuinely is not recorded anywhere.
+//
+// Lives here rather than in api/ so that domain/ does not have to import from
+// api/, which would invert the layering.
+export function createdSortKey(b) {
+  if (b.createdAtMs != null && !Number.isNaN(b.createdAtMs)) return b.createdAtMs;
+  return creationMs(b.id);
+}
