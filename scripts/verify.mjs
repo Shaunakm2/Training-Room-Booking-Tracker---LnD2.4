@@ -290,6 +290,61 @@ function stripNoise(src) {
     }
   }
 
+  // Room capacities are declared twice: ROOMS in js/config.js (used by the UI)
+  // and a CASE in enforce_room_capacity (enforced by the database). They must
+  // agree, or the form and the trigger disagree about whether a booking fits.
+  {
+    const cfg = read('js/config.js');
+    const caps = new Map();
+    for (const m of cfg.matchAll(/id:\s*'([^']+)'[^}]*?capacity:\s*(\d+)/g)) {
+      caps.set(m[1], Number(m[2]));
+    }
+    const fn = sql.match(/v_cap := case new\.room([\s\S]*?)end;/);
+    if (!caps.size || !fn) {
+      warn('room capacities agree', 'could not parse config.js ROOMS or the SQL CASE');
+    } else {
+      const sqlCaps = new Map();
+      for (const m of fn[1].matchAll(/when\s*'([^']+)'\s*then\s*(\d+)/g)) {
+        sqlCaps.set(m[1], Number(m[2]));
+      }
+      const elseM = fn[1].match(/else\s*(\d+)/);
+      const dflt = elseM ? Number(elseM[1]) : null;
+      const bad = [];
+      for (const [id, cap] of caps) {
+        const expected = sqlCaps.has(id) ? sqlCaps.get(id) : dflt;
+        if (expected !== cap) bad.push(`${id}: config=${cap} sql=${expected}`);
+      }
+      // A room named in the SQL that no longer exists in config is also drift.
+      for (const id of sqlCaps.keys()) {
+        if (!caps.has(id)) bad.push(`${id}: in SQL but not in config.js ROOMS`);
+      }
+      bad.length
+        ? fail('room capacities agree', bad.join('; '))
+        : ok('room capacities agree', `${caps.size} rooms, default ${dflt}`);
+    }
+  }
+
+  // createdSortKey must live in utils/ids.js, not api/. Putting it in api/
+  // made domain/filters-sort.js import from the api layer.
+  {
+    const ids = stripComments(read('js/utils/ids.js'));
+    const domainImportsApi = /from '\.\.\/api\//.test(read('js/domain/filters-sort.js'));
+    (/function createdSortKey/.test(ids) && !domainImportsApi)
+      ? ok('createdSortKey is in utils, domain stays pure')
+      : fail('createdSortKey is in utils, domain stays pure',
+             domainImportsApi ? 'domain/ imports from api/' : 'helper not in utils/ids.js');
+  }
+
+  // Creation-time sorting must prefer the created_at column, with a fallback
+  // for the nulls that genuinely exist in production.
+  {
+    const ids = stripComments(read('js/utils/ids.js'));
+    (/createdAtMs/.test(ids) && /creationMs\(b\.id\)/.test(ids))
+      ? ok('creation sort prefers created_at with fallback')
+      : fail('creation sort prefers created_at with fallback',
+             'either the column is ignored or the id fallback is gone');
+  }
+
   // showConfirmModal must settle a pending promise before taking the slot,
   // or opening a second confirm orphans the first `await` forever.
   {
