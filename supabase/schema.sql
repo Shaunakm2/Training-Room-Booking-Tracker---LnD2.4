@@ -931,6 +931,76 @@ $$;
 
 
 -- ============================================================
+-- 12c. REPORTING VIEWS
+-- ------------------------------------------------------------
+-- The daily archive job keeps public.bookings to a rolling ~90 days, so any
+-- trend question asked against that table silently answers from three months
+-- of data. These present live + archive as one dataset for analysis.
+--
+-- security_invoker = true is NOT OPTIONAL. On Postgres 15+ a view runs with
+-- its OWNER's privileges and bypasses RLS on the underlying tables entirely —
+-- without this, bookings_all would hand anon a way around every policy in
+-- section 2, including the restrictive one that hides rejected bookings.
+--
+-- The revokes are also NOT optional. Supabase sets default privileges on the
+-- public schema, so a new view is granted to anon AND authenticated the moment
+-- it exists. "I did not grant it" is not the same as "it is not granted".
+--
+-- Columns are named rather than `select *`: positional matching between the
+-- two tables breaks silently the moment they drift.
+--
+-- To remove: drop room_utilisation_monthly FIRST (it depends on bookings_all).
+-- ============================================================
+
+create or replace view public.bookings_all
+with (security_invoker = true) as
+  select
+    booking_id, room, booked_by, purpose, booking_date, start_time,
+    end_time, attendees, status, end_date, conflict_resolved,
+    conflict_note, created_at,
+    'live'::text as source
+  from public.bookings
+  union all
+  select
+    booking_id, room, booked_by, purpose, booking_date, start_time,
+    end_time, attendees, status, end_date, conflict_resolved,
+    conflict_note, created_at,
+    'archive'::text as source
+  from public.bookings_archive;
+
+revoke all on public.bookings_all from anon, authenticated;
+
+comment on view public.bookings_all is
+  'Live + archived bookings as one dataset, for reporting in the SQL editor. security_invoker=true so RLS still applies. Not granted to anon or authenticated.';
+
+-- Booked hours per room per month, confirmed only. coalesce(end_date, ...)
+-- handles bookings that cross midnight, which are common here — without it a
+-- 6:30 PM to 3:30 AM booking computes as negative hours.
+create or replace view public.room_utilisation_monthly
+with (security_invoker = true) as
+  select
+    room,
+    date_trunc('month', booking_date)::date as month,
+    count(*)                                as bookings,
+    round(sum(
+      extract(epoch from (
+        (coalesce(end_date, booking_date) + end_time)
+        - (booking_date + start_time)
+      )) / 3600.0
+    )::numeric, 1)                          as booked_hours,
+    round(avg(attendees)::numeric, 1)       as avg_attendees,
+    max(attendees)                          as max_attendees
+  from public.bookings_all
+  where status = 'Confirmed'
+  group by room, date_trunc('month', booking_date);
+
+revoke all on public.room_utilisation_monthly from anon, authenticated;
+
+comment on view public.room_utilisation_monthly is
+  'Booked hours and headcount per room per month, confirmed only, across live + archive.';
+
+
+-- ============================================================
 -- 13. OPEN ITEMS — reviewed, not yet applied
 -- ============================================================
 -- Recorded here so they are not rediscovered from scratch. None are
