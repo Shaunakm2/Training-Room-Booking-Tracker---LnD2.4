@@ -290,6 +290,50 @@ function stripNoise(src) {
     }
   }
 
+  // showConfirmModal must settle a pending promise before taking the slot,
+  // or opening a second confirm orphans the first `await` forever.
+  {
+    const d = stripComments(read('js/utils/dom-helpers.js'));
+    /if \(_confirmModalResolve\) _confirmModalResolve\(false\)/.test(d)
+      ? ok('showConfirmModal settles pending promises')
+      : fail('showConfirmModal settles pending promises', 'a second confirm will orphan the first');
+  }
+
+  // ids.js: DAY_MS / EARLIEST_PLAUSIBLE_MS are const, so they must appear
+  // BEFORE creationMs(). Declared after, any top-level call throws a TDZ
+  // ReferenceError.
+  {
+    const i = stripComments(read('js/utils/ids.js'));
+    const c = i.indexOf('const EARLIEST_PLAUSIBLE_MS');
+    const f = i.indexOf('function creationMs');
+    (c !== -1 && f !== -1 && c < f)
+      ? ok('ids.js constants precede creationMs')
+      : fail('ids.js constants precede creationMs', 'temporal dead zone hazard');
+  }
+
+  // Pre-flight refreshes must bypass the write debounce, or a save within 3s
+  // of the previous one checks conflicts against stale data.
+  {
+    const problems = [];
+    for (const f of ['js/ui/admin-table.js', 'js/ui/request-form.js']) {
+      const src = stripComments(read(f));
+      if (/loadData\(true\)\s*[;,)]/.test(src)) problems.push(f);
+    }
+    problems.length
+      ? fail('pre-flight refreshes are forced', `${problems.join(', ')} still call loadData(true)`)
+      : ok('pre-flight refreshes are forced');
+  }
+
+  // Dead state must not come back: sessionToken was written five times and
+  // read never, with a comment claiming it was required for admin writes.
+  {
+    const any = ['js/state.js', 'js/api/auth.js']
+      .filter(f => /setSessionToken\s*\(/.test(stripComments(read(f))));
+    any.length
+      ? fail('sessionToken stays removed', any.join(', '))
+      : ok('sessionToken stays removed');
+  }
+
   // Active Now must filter on STATUS as well as time. bookingTimeStatus()
   // answers only "is now inside this window" and knows nothing about status,
   // so using it alone put Rejected and Cancelled bookings under ACTIVE NOW
