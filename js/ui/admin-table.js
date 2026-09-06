@@ -354,7 +354,10 @@ export async function submitBooking(e) {
   if (dates.length === 0) { showError('No weekdays found in selected range.'); return; }
 
   document.getElementById('form-error').classList.remove('visible');
-  try { await loadData(true); } catch (e) {}
+  // force=true: this is a pre-flight refresh for the conflict check below,
+  // not a poll. Without it a save within 3s of the previous one silently
+  // skipped the refresh and checked conflicts against stale data.
+  try { await loadData(true, true); } catch (e) {}
 
   // Single booking edit (non-recurring)
   if (id && !isRecurring) {
@@ -773,7 +776,20 @@ export function exportExcel() {
       'Floor': room.floor || '',
       'Booked By': b.booker,
       'Purpose': displayPurpose(b.purpose) || '',
-      'Date': b.date,
+      // A real Date, not the 'YYYY-MM-DD' string. As text, Excel will not
+      // sort chronologically or accept date filters — which defeats the point
+      // of exporting for analysis.
+      //
+      // Parsed as LOCAL midnight rather than `new Date(b.date)`, which reads a
+      // bare date string as UTC. That is harmless at IST (+5:30, so UTC
+      // midnight is still the same calendar day) but shifts the date a day
+      // backwards at any negative offset. Local parsing is correct everywhere,
+      // and matches domain/time.js, which avoids Date for date maths entirely
+      // for the same reason.
+      'Date': (() => {
+        const [y, m, d] = String(b.date).split('-').map(Number);
+        return (y && m && d) ? new Date(y, m - 1, d) : b.date;
+      })(),
       'Start Time': fmtTime(b.start),
       'End Time': fmtTime(b.end),
       'Attendees': b.attendees || '',
@@ -789,7 +805,9 @@ export function exportExcel() {
     toast('No bookings match the current filters — nothing to export.', true);
     return;
   }
-  const ws = XLSX.utils.json_to_sheet(rows, { header: headers });
+  // cellDates + dateNF make SheetJS write real date cells with a readable
+  // format rather than serial numbers.
+  const ws = XLSX.utils.json_to_sheet(rows, { header: headers, cellDates: true, dateNF: 'dd-mmm-yyyy' });
   ws['!cols'] = [20,18,22,28,14,14,14,12,12,30].map(w => ({ wch: w }));
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Room Bookings');
