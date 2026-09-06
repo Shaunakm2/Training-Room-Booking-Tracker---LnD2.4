@@ -11,7 +11,7 @@ import {
   adminLoggedIn,
   loginAttempts, setLoginAttempts, loginLockedUntil, setLoginLockedUntil,
   MAX_LOGIN_ATTEMPTS, LOCKOUT_MS, setLastActivityAt,
-  setAdminLoggedIn, setSessionToken
+  setAdminLoggedIn
 } from '../state.js';
 import { toast, showLoadingOverlay } from '../utils/dom-helpers.js';
 import { showPage } from '../ui/pages.js'; // see note above
@@ -40,7 +40,6 @@ export async function restoreSession() {
     // (or a stale session from a different project) is ignored.
     if ((session.user?.email || '').toLowerCase() !== ADMIN_EMAIL.toLowerCase()) return false;
     setAdminLoggedIn(true);
-    setSessionToken(session.access_token);
     setLastActivityAt(Date.now());
     const btn = document.getElementById('logout-btn');
     if (btn) btn.style.display = '';
@@ -58,13 +57,11 @@ export async function restoreSession() {
 export async function expireSession() {
   try { await supabase.auth.signOut(); } catch (e) { /* clear local state regardless */ }
   setAdminLoggedIn(false);
-  setSessionToken(null);
 }
 
 export async function doLogout() {
   await supabase.auth.signOut();
   setAdminLoggedIn(false);
-  setSessionToken(null);
   // Clear the persisted idle-timer stamp too, so a later page load doesn't
   // evaluate a stale timestamp against a fresh session.
   try { localStorage.removeItem('ldrooms-last-activity'); } catch (_) {}
@@ -126,7 +123,6 @@ export async function doLogin() {
       // session isn't judged against a timestamp from a previous session.
       try { localStorage.setItem('ldrooms-last-activity', String(Date.now())); } catch (_) {}
       setAdminLoggedIn(true);
-      setSessionToken(data.session.access_token);
       document.getElementById('logout-btn').style.display = '';
       document.getElementById('login-modal').style.display = 'none';
       document.getElementById('login-pw').value = '';
