@@ -290,6 +290,34 @@ function stripNoise(src) {
     }
   }
 
+  // The idle watchdog must check staleness BEFORE resetting the clock.
+  // The interval samples every 15s but activity events arrive instantly, so
+  // the first mousemove after a laptop wakes used to erase the idle gap
+  // before the interval could observe it — an overnight session survived.
+  {
+    const app = stripComments(read('js/app.js'));
+    const m = app.match(/function _touchActivity\(\)[\s\S]*?\n\}/);
+    if (!m) {
+      warn('idle check runs before the clock resets', 'could not locate _touchActivity');
+    } else {
+      const iCheck = m[0].search(/SESSION_TIMEOUT_MS/);
+      const iReset = m[0].search(/_lastActivityAt = now/);
+      (iCheck !== -1 && iReset !== -1 && iCheck < iReset)
+        ? ok('idle check runs before the clock resets')
+        : fail('idle check runs before the clock resets',
+               'returning to the machine will erase the idle period');
+    }
+  }
+
+  // Idle time must be read across tabs, or a second idle tab expires a
+  // session the user is actively using elsewhere.
+  {
+    const app = stripComments(read('js/app.js'));
+    /_lastActivitySeen\(\)/.test(app) && /Math\.max/.test(app)
+      ? ok('idle time is cross-tab aware')
+      : fail('idle time is cross-tab aware', 'a background tab can expire an active session');
+  }
+
   // Room capacities are declared twice: ROOMS in js/config.js (used by the UI)
   // and a CASE in enforce_room_capacity (enforced by the database). They must
   // agree, or the form and the trigger disagree about whether a booking fits.
