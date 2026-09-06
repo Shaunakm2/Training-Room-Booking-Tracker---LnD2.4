@@ -161,7 +161,7 @@ export async function submitRequest() {
   // other devices since this page loaded.
   try {
     showLoadingOverlay(true);
-    await loadData(true);
+    await loadData(true, true); // force: pre-flight, must not be debounced
   } catch (e) { /* proceed with cached data if fetch fails */ }
   finally { showLoadingOverlay(false); }
 
