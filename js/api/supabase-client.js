@@ -4,7 +4,8 @@
 
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from '../config.js';
 import { bookings, setBookings } from '../state.js';
-import { creationMs } from '../utils/ids.js';
+import { createdSortKey } from '../utils/ids.js';
+
 import { toast, showLoadingOverlay } from '../utils/dom-helpers.js';
 
 // `window.supabase` here is the global injected by the Supabase JS SDK
@@ -73,12 +74,24 @@ export async function loadData(silent = false, force = false) {
       status: String(r.status || 'Confirmed').trim(),
       endDate: String(r.end_date || '').trim(),
       conflictResolved: !!r.conflict_resolved,
-      conflictNote: String(r.conflict_note || '').trim()
+      conflictNote: String(r.conflict_note || '').trim(),
+      // Real creation time from the column, in ms, or null.
+      //
+      // created_at is NULLABLE by design: rows predating the column have no
+      // recoverable creation time, and defaulting them to now() would make
+      // the oldest rows look newest. It is NOT fully backfilled — a null was
+      // found in production when it broke an archive run. So every consumer
+      // must handle null, which is why creationMs() stays as the fallback
+      // rather than being deleted.
+      createdAtMs: r.created_at ? Date.parse(r.created_at) : null
     }));
-    // Newest created first. Uses creationMs() rather than comparing id
-    // strings — legacy rows have ids without the 'b' prefix and would
-    // otherwise sort above everything the app has ever created.
-    mapped.sort((a, b) => creationMs(b.id) - creationMs(a.id));
+    // Newest created first. Prefers the created_at column and falls back to
+    // decoding the id, for rows where created_at is null.
+    //
+    // NEVER compare id strings directly: legacy ids have no 'b' prefix and
+    // 'z...' beats every 'b...' lexicographically, which pinned the same old
+    // rows to the top of "Recently Added" forever. That bug shipped twice.
+    mapped.sort((a, b) => createdSortKey(b) - createdSortKey(a));
     setBookings(mapped);
   } catch (e) {
     console.error('Load error', e);
