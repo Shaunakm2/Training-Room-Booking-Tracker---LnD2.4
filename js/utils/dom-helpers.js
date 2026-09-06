@@ -86,6 +86,14 @@ export function updateClock() {
 let _confirmModalResolve = null;
 export function showConfirmModal(message, confirmLabel, confirmClass) {
   return new Promise(resolve => {
+    // Settle any confirm still waiting before taking over the slot. There is
+    // one _confirmModalResolve, so opening a second confirm used to orphan the
+    // first promise forever — its `await` never returned, leaving the caller
+    // stuck and (because most call sites sit inside a try/finally that hides
+    // the loading overlay) the overlay up with no way out.
+    // false = "treat the abandoned prompt as declined", which is the safe
+    // reading for a dialog the user never actually answered.
+    if (_confirmModalResolve) _confirmModalResolve(false);
     _confirmModalResolve = resolve;
     document.getElementById('confirm-modal-message').textContent = message;
     const btn = document.getElementById('confirm-modal-confirm-btn');
