@@ -22,8 +22,15 @@ function writeRecentlyCompleted() {
   return (Date.now() - _writeCompletedAt) < 3000;
 }
 
-export async function loadData(silent = false) {
-  if (silent && writeRecentlyCompleted()) return;
+// silent: no loading overlay, and subject to the write debounce.
+// force:  bypass the debounce. Use for a DELIBERATE pre-flight refresh before
+//         a conflict check — that is not the same thing as a background poll.
+//         The debounce exists to stop the 60s poll clobbering an in-flight
+//         optimistic update, but it also silently no-op'd the refresh that
+//         runs just before a save, so two bookings created within 3 seconds
+//         of each other could miss a conflict between them.
+export async function loadData(silent = false, force = false) {
+  if (silent && !force && writeRecentlyCompleted()) return;
   try {
     if (!silent) showLoadingOverlay(true);
     const { data, error } = await supabase
