@@ -24,6 +24,15 @@ export function genId() {
 // The proper long-term fix is a real `created_at timestamptz default now()`
 // column on public.bookings; this decoder exists because the id is currently
 // the only creation-time signal available for existing data.
+// Declared ABOVE creationMs() on purpose. These are `const`, so they sit in
+// the temporal dead zone until this line executes — the function only worked
+// because nothing calls it during module evaluation. Any future top-level
+// call would have thrown "Cannot access before initialization".
+const DAY_MS = 86400000;
+// 2024-01-01. Nothing in this system predates it, so anything earlier is a
+// coincidental decode rather than a real creation time.
+const EARLIEST_PLAUSIBLE_MS = 1704067200000;
+
 export function creationMs(id) {
   const head = String(id || '').slice(0, 9);
   if (!/^b[0-9a-z]{8}$/.test(head)) return -1;
@@ -40,8 +49,3 @@ export function creationMs(id) {
   if (ms < EARLIEST_PLAUSIBLE_MS) return -1; // decoded before this app existed
   return ms;
 }
-
-const DAY_MS = 86400000;
-// 2024-01-01. Nothing in this system predates it, so anything earlier is a
-// coincidental decode rather than a real creation time.
-const EARLIEST_PLAUSIBLE_MS = 1704067200000;
