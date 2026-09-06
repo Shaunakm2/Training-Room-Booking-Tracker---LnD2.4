@@ -559,7 +559,18 @@ begin
     return new;
   end if;
 
-  -- NOTE: these seat counts duplicate ROOMS in js/config.js. Keep them in step.
+  -- SEAT COUNTS DUPLICATE js/config.js ROOMS. Kept as a CASE rather than a
+  -- lookup table because the app reads capacity from config.js client-side;
+  -- a rooms table would be a THIRD source of truth unless the whole app moved
+  -- to reading it, which is a bigger change than this is worth.
+  --
+  -- Drift is instead made impossible to ship: scripts/verify.mjs parses the
+  -- capacities out of js/config.js and out of this CASE and fails if they
+  -- disagree. If you change a room's capacity, change BOTH — CI will tell you
+  -- if you forget.
+  --
+  -- The `else` covers every room not named above, so a NEW room added to
+  -- config.js with a non-default capacity must be added here explicitly.
   v_cap := case new.room
     when 'chanakya' then 45
     when 'conf2f'   then 5
