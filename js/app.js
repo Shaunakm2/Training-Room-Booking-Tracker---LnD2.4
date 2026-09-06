@@ -178,11 +178,39 @@ let _lastActivityAt = Date.now();
 let _sessionWarningShown = false;
 let _lastTouchWrite = 0;
 
+// Last activity across ALL tabs. _lastActivityAt is per-tab; the localStorage
+// stamp is shared. Taking the max stops a second tab that has been sitting
+// idle from expiring a session the user has been actively using elsewhere.
+function _lastActivitySeen() {
+  let stored = 0;
+  try { stored = Number(localStorage.getItem(ACTIVITY_KEY)) || 0; } catch (_) {}
+  return Math.max(_lastActivityAt || 0, stored);
+}
+
 function _touchActivity() {
   const now = Date.now();
-  // mousemove fires dozens of times a second; throttle the localStorage write.
+  // mousemove fires dozens of times a second; throttle first, for cost.
   if (now - _lastTouchWrite < 5000) return;
   _lastTouchWrite = now;
+
+  // CHECK BEFORE RESETTING. This is the whole point of the function.
+  //
+  // The watchdog below only samples every 15 seconds, but activity events
+  // arrive instantly. So the first mousemove after the laptop woke from an
+  // overnight sleep used to set _lastActivityAt = now BEFORE the interval
+  // ever observed the gap — the act of returning to the machine erased the
+  // evidence of having been away, and the session survived indefinitely.
+  // Suspended tabs have frozen timers, so the interval cannot win that race
+  // reliably.
+  //
+  // An event arriving after the timeout has already elapsed IS the return
+  // from an idle period, not activity during one.
+  const last = _lastActivitySeen();
+  if (adminLoggedIn && last && now - last > SESSION_TIMEOUT_MS) {
+    _endSession();
+    return;
+  }
+
   _lastActivityAt = now;
   _sessionWarningShown = false;
   try { localStorage.setItem(ACTIVITY_KEY, String(now)); } catch (_) {}
@@ -211,7 +239,7 @@ function _endSession() {
 
 setInterval(() => {
   if (!adminLoggedIn) return;
-  const idleFor = Date.now() - _lastActivityAt;
+  const idleFor = Date.now() - _lastActivitySeen();
   if (idleFor > SESSION_TIMEOUT_MS) {
     _endSession();
   } else if (idleFor > SESSION_TIMEOUT_MS - SESSION_WARNING_MS && !_sessionWarningShown) {
