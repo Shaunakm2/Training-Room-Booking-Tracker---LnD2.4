@@ -18,8 +18,10 @@ export function setBookings(arr) { bookings = arr; }
 export let adminLoggedIn = false;
 export function setAdminLoggedIn(v) { adminLoggedIn = v; }
 
-export let sessionToken = null; // issued by server on login, required for all admin writes
-export function setSessionToken(v) { sessionToken = v; }
+// sessionToken/setSessionToken removed. It was written in five places and read
+// in none, and its comment claimed it was "required for all admin writes",
+// which is false — supabase-js attaches the JWT to every request itself.
+// A misleading comment on dead state is worse than no comment.
 
 // Admin-table bulk selection, held here rather than read from the DOM.
 // getSelectedIds() used to be `querySelectorAll('.row-cb:checked')`, but only
