@@ -8,7 +8,7 @@
 import { bookings, sortField, sortDir } from '../state.js';
 import { todayStr, bookingSpans, nowMinutes } from './time.js';
 import { roomName } from '../config.js';
-import { creationMs } from '../utils/ids.js';
+import { createdSortKey } from '../utils/ids.js';
 import { getLiveConflicts } from './conflicts.js';
 
 // 'active' | 'past' | 'upcoming' relative to now, handling overnight spans
@@ -65,7 +65,7 @@ export function getFilteredBookings() {
     isPast: bookingTimeStatus(b) === 'past',
     roomKey: roomName(b.room).toLowerCase(),
     statusKey: (b.status || '').toLowerCase(),
-    createdAt: creationMs(b.id)
+    createdAt: createdSortKey(b)
   }));
 
   const cmp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
@@ -91,12 +91,14 @@ export function getFilteredBookings() {
       if (sortField === 'status') return dir * cmp(x.statusKey, y.statusKey) || cmp(x.dateKey, y.dateKey);
       // 'bookingdate' desc = "Latest": furthest-future booking first.
       if (sortField === 'bookingdate') return dir * cmp(x.dateKey, y.dateKey);
-      // "Recently Added" / "Oldest Added" — real creation time decoded from
-      // the id by creationMs(). Legacy rows (no 'b' prefix) return -1 and so
-      // sort as oldest, which is honest: their creation time isn't recorded
-      // anywhere. Do NOT go back to comparing id strings directly — 'z...'
-      // and 'y...' legacy ids beat every 'b...' id lexicographically, which
-      // pinned the same old rows to the top of "Recently Added" forever.
+      // "Recently Added" / "Oldest Added" — createdSortKey() prefers the
+      // created_at column and falls back to decoding the id where that column
+      // is null (it is nullable by design and not fully backfilled). Rows with
+      // neither return -1 and sort as oldest, which is honest: their creation
+      // time isn't recorded anywhere. Do NOT go back to comparing id strings
+      // directly — 'z...' and 'y...' legacy ids beat every 'b...' id
+      // lexicographically, which pinned the same old rows to the top of
+      // "Recently Added" forever. That shipped twice.
       return dir * cmp(x.createdAt, y.createdAt) || cmp(x.dateKey, y.dateKey);
     });
   }
