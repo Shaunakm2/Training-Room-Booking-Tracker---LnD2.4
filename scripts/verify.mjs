@@ -290,6 +290,65 @@ function stripNoise(src) {
     }
   }
 
+  // Both release paths must refuse a release at or before the start minute:
+  // end <= start reads as OVERNIGHT and turns a freed room into a 24h block.
+  {
+    const problems = [];
+    for (const f of ['js/ui/admin-table.js', 'js/ui/cancel-release.js']) {
+      if (!/releaseWouldBeEmpty\(/.test(stripComments(read(f)))) problems.push(f);
+    }
+    if (!/v_new_end <= v_start/.test(sql)) problems.push('schema.sql (server guard still `<`)');
+    problems.length
+      ? fail('release refuses zero-length results', problems.join(', '))
+      : ok('release refuses zero-length results');
+  }
+
+  // The Today filter must reason in spans like everything else, or an
+  // overnight booking running right now vanishes from it.
+  {
+    const fs = stripComments(read('js/domain/filters-sort.js'));
+    /filterDate === 'today'[\s\S]{0,160}bookingSpans/.test(fs)
+      ? ok('Today filter uses spans')
+      : fail('Today filter uses spans', 'currently-running overnight bookings will be hidden');
+  }
+
+  // Alternate-room suggestions must respect capacity, and there must be only
+  // ONE definition of getFreeRoomsForDate.
+  {
+    const defs = ['js/domain/conflicts.js', 'js/ui/conflict-picker.js']
+      .filter(f => /function getFreeRoomsForDate/.test(stripComments(read(f))));
+    const c = stripComments(read('js/domain/conflicts.js'));
+    const problems = [];
+    if (defs.length !== 1) problems.push(`${defs.length} definitions: ${defs.join(', ')}`);
+    if (!/r\.capacity/.test(c)) problems.push('capacity not considered');
+    problems.length
+      ? fail('free-room suggestions respect capacity', problems.join('; '))
+      : ok('free-room suggestions respect capacity');
+  }
+
+  // Recurring ranges must be capped in BOTH forms.
+  {
+    const missing = ['js/ui/admin-table.js', 'js/ui/request-form.js']
+      .filter(f => !/MAX_RECURRING_DATES/.test(stripComments(read(f))));
+    missing.length
+      ? fail('recurring range is capped', missing.join(', '))
+      : ok('recurring range is capped');
+  }
+
+  // Backdating: public refused client-side AND in the policy; admin prompted.
+  {
+    const problems = [];
+    if (!/date < todayStr\(\)/.test(stripComments(read('js/ui/request-form.js'))))
+      problems.push('public form allows past dates');
+    if (!/booking_date >= current_date/.test(sql))
+      problems.push('public INSERT policy allows past dates');
+    if (!/Book in the Past/.test(read('js/ui/admin-table.js')))
+      problems.push('admin form does not warn');
+    problems.length
+      ? fail('backdating is public-blocked, admin-warned', problems.join('; '))
+      : ok('backdating is public-blocked, admin-warned');
+  }
+
   // The idle watchdog must check staleness BEFORE resetting the clock.
   // The interval samples every 15s but activity events arrive instantly, so
   // the first mousemove after a laptop wakes used to erase the idle gap
