@@ -52,9 +52,15 @@ export function formatLiveConflictNote(conflicts) {
   if (conflicts.length === 1) return `⚠️ Overlap: ${describeConflict(conflicts[0])}`;
   return `⚠️ ${conflicts.length} overlaps: ` + conflicts.map(describeConflict).join('; ');
 }
-export function getFreeRoomsForDate(date, start, end, excludeRoom) {
+// attendees is optional but SHOULD be passed. Without it this offers rooms
+// that are free but too small — a 20-person group was being sent to a 5-seat
+// conference room, where the capacity trigger then rejected the booking with
+// a generic failure and no explanation of why.
+export function getFreeRoomsForDate(date, start, end, excludeRoom, attendees) {
+  const need = Number(attendees) || 0;
   return ROOMS.filter(r => {
     if (r.id === excludeRoom) return false;
+    if (need && r.capacity && need > r.capacity) return false;
     return !findConflict(r.id, date, start, end, null);
   });
 }
