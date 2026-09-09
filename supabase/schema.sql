@@ -147,6 +147,18 @@ create policy "Public can create pending requests"
     status = 'Pending'
     and conflict_resolved = false
     and (conflict_note is null or conflict_note = '')
+    -- No backdating from the public form. The client refuses too, but that is
+    -- UX only: anyone can POST here directly with the publishable key.
+    --
+    -- Admins are unaffected. This policy applies to the `public` role for
+    -- INSERT, while admin inserts go through "Admins can insert any booking";
+    -- multiple PERMISSIVE policies OR together, so satisfying the admin one is
+    -- enough. Admins may backdate, with a confirmation prompt in the form.
+    --
+    -- current_date is UTC and IST is ahead of it, so a booking for "today" in
+    -- local terms always satisfies this. The comparison is lenient by exactly
+    -- the timezone offset, never strict.
+    and booking_date >= current_date
   );
 
 -- Identity check for the three admin policies below.
@@ -296,8 +308,12 @@ begin
     return json_build_object('ok', false, 'error', 'Release cannot extend a booking.');
   end if;
 
-  if v_new_end < v_start then
-    return json_build_object('ok', false, 'error', 'Release time is before the booking starts — cancel it instead.');
+  -- `<=`, not `<`. new_end EXACTLY equal to the start is the damaging case:
+  -- the client reads end <= start as an overnight booking, so a "release" in
+  -- the booking's opening minute silently converts it into a 24-hour block
+  -- spanning two calendar days. A zero-length booking is never valid anyway.
+  if v_new_end <= v_start then
+    return json_build_object('ok', false, 'error', 'Release time is at or before the booking start — cancel it instead.');
   end if;
 
   update public.bookings
