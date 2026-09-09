@@ -89,3 +89,25 @@ export function getWeekdays(startStr, endStr) {
   }
   return dates;
 }
+
+// Compares two (date, minutes) points. Returns <0, 0 or >0.
+export function cmpDateTime(dateA, minsA, dateB, minsB) {
+  if (dateA !== dateB) return dateA < dateB ? -1 : 1;
+  return minsA - minsB;
+}
+
+// Would releasing this booking NOW leave it with zero or negative length?
+//
+// Release sets end = the current time. If that lands at or before the
+// booking's start, the result is not a shortened booking — `end <= start` is
+// how bookingSpans() detects an OVERNIGHT booking, so the row silently
+// becomes a 24-hour block that occupies the room for two calendar days and
+// blocks every other booking via conflict detection.
+//
+// Reachable for a full minute: bookingTimeStatus() reports 'active' from
+// now === start, so the Release button is live during the booking's own
+// opening minute. Releasing in that minute is really a cancellation.
+export function releaseWouldBeEmpty(b, nowDate, nowMins) {
+  const startMins = minutesSinceMidnight(b.start);
+  return cmpDateTime(nowDate, nowMins, b.date, startMins) <= 0;
+}
