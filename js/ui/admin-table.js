@@ -4,14 +4,14 @@
 // layer — this is the direct split of the largest chunk of the original
 // app.js admin section.
 
-import { ROOMS, roomName, PAGE_SIZE } from '../config.js';
+import { MAX_RECURRING_DATES, ROOMS, roomName, PAGE_SIZE } from '../config.js';
 import {
   bookings, tablePage, setTablePage,
   deleteTargetId, setDeleteTargetId, setBookings, setSortField, setSortDir,
   selectedIds, setSelectedIds
 } from '../state.js';
 import { getFilteredBookings, bookingTimeStatus } from '../domain/filters-sort.js';
-import { todayStr, minutesSinceMidnight, addDaysStr, isOvernight, getWeekdays } from '../domain/time.js';
+import { releaseWouldBeEmpty, todayStr, minutesSinceMidnight, addDaysStr, isOvernight, getWeekdays } from '../domain/time.js';
 import { getLiveConflicts, findConflict, formatLiveConflictNote, getFreeRoomsForDate } from '../domain/conflicts.js';
 import { fmtDate, fmtTime, displayPurpose } from '../utils/formatting.js';
 import { escHtml, toast, showLoadingOverlay, showConfirmModal } from '../utils/dom-helpers.js';
@@ -214,6 +214,17 @@ export async function adminReleaseEarly(bookingId) {
     toast('This booking is no longer active.', true);
     return;
   }
+  {
+    // Releasing at or before the start minute would set end <= start, which
+    // bookingSpans() reads as OVERNIGHT — turning a released room into a
+    // 24-hour block instead of freeing it. That is a cancellation, not a
+    // release, so say so.
+    const n = new Date();
+    if (releaseWouldBeEmpty(b, todayStr(), n.getHours() * 60 + n.getMinutes())) {
+      toast('This booking has only just started — use Delete or Cancel instead of Release.', true);
+      return;
+    }
+  }
   try {
     showLoadingOverlay(true);
     const now = new Date();
@@ -352,6 +363,25 @@ export async function submitBooking(e) {
 
   const dates = isRecurring ? getWeekdays(date, dateEnd) : [date];
   if (dates.length === 0) { showError('No weekdays found in selected range.'); return; }
+  // Admins MAY backdate — correcting records after the fact is legitimate —
+  // but it should never happen by accident, e.g. a mistyped year. The public
+  // form refuses outright; a direct database insert is the other sanctioned
+  // route.
+  {
+    const past = dates.filter(d => d < todayStr());
+    if (past.length > 0) {
+      const label = past.length === 1
+        ? `${fmtDate(past[0])} is in the past.`
+        : `${past.length} of these dates are in the past (earliest ${fmtDate(past.sort()[0])}).`;
+      const okPast = await showConfirmModal(
+        `${label} Create the booking anyway?`, 'Book in the Past', 'btn-approve');
+      if (!okPast) return;
+    }
+  }
+  if (dates.length > MAX_RECURRING_DATES) {
+    showError(`That range covers ${dates.length} weekdays — the maximum is ${MAX_RECURRING_DATES}. Shorten the end date and repeat if you need more.`);
+    return;
+  }
 
   document.getElementById('form-error').classList.remove('visible');
   // force=true: this is a pre-flight refresh for the conflict check below,
@@ -363,7 +393,7 @@ export async function submitBooking(e) {
   if (id && !isRecurring) {
     const conflict = findConflict(room, date, start, end, id);
     if (conflict) {
-      const freeAlts = getFreeRoomsForDate(date, start, end, room);
+      const freeAlts = getFreeRoomsForDate(date, start, end, room, attendees);
       let msg = `Conflict: ${roomName(room)} is booked ${fmtTime(conflict.start)}–${fmtTime(conflict.end)} by ${conflict.booker}.`;
       if (freeAlts.length > 0) msg += ` Free alternatives: ${freeAlts.map(r => r.name).join(', ')}.`;
       else msg += ' No other rooms are free at this time.';
@@ -667,7 +697,7 @@ export async function bulkApprove() {
     const conflict = findConflict(b.room, b.date, b.start, b.end, b.id);
     if (conflict) {
       conflictItems.push({ id: b.id, room: b.room, date: b.date, start: b.start,
-                           end: b.end, booker: b.booker, purpose: b.purpose, conflict });
+                           end: b.end, booker: b.booker, purpose: b.purpose, attendees: b.attendees, conflict });
     } else {
       cleanIds.push(b.id);
     }
