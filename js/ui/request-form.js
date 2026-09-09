@@ -4,7 +4,7 @@
 // to the conflict-picker (public/Pending mode) instead of submitting
 // everything blind with just a warning note afterward.
 
-import { ROOMS, roomName } from '../config.js';
+import { MAX_RECURRING_DATES, ROOMS, roomName } from '../config.js';
 import { bookings } from '../state.js';
 import { todayStr, minutesSinceMidnight, addDaysStr, getWeekdays } from '../domain/time.js';
 import { fmtTime, fmtDate } from '../utils/formatting.js';
@@ -146,6 +146,14 @@ export async function submitRequest() {
     errEl.textContent = 'Please select an end date for the recurring range.';
     errEl.classList.add('visible'); return;
   }
+  // Public requests may not be backdated. Admins can, with a warning, and a
+  // direct database insert always can — those are the two deliberate routes.
+  // Enforced server-side too, in the "Public can create pending requests"
+  // policy, since this check is only UX.
+  if (date < todayStr()) {
+    errEl.textContent = 'Bookings cannot be made for a past date.';
+    errEl.classList.add('visible'); return;
+  }
   if (isRecurring && dateEnd < date) {
     errEl.textContent = 'End date must be on or after start date.';
     errEl.classList.add('visible'); return;
@@ -168,6 +176,10 @@ export async function submitRequest() {
   const dates = isRecurring ? getWeekdays(date, dateEnd) : [date];
   if (dates.length === 0) {
     errEl.textContent = 'No weekdays found in selected range.';
+    errEl.classList.add('visible'); return;
+  }
+  if (dates.length > MAX_RECURRING_DATES) {
+    errEl.textContent = `That range covers ${dates.length} weekdays — the maximum is ${MAX_RECURRING_DATES}. Please shorten the end date.`;
     errEl.classList.add('visible'); return;
   }
 
