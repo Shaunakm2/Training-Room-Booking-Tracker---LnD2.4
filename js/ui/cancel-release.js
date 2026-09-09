@@ -8,7 +8,7 @@
 // prevented outright.
 
 import { bookings } from '../state.js';
-import { todayStr } from '../domain/time.js';
+import { releaseWouldBeEmpty, todayStr } from '../domain/time.js';
 import { bookingTimeStatus } from '../domain/filters-sort.js';
 import { fmtDate, fmtTime, displayPurpose } from '../utils/formatting.js';
 import { escHtml, toast, showLoadingOverlay } from '../utils/dom-helpers.js';
@@ -92,6 +92,18 @@ export async function confirmCancelOrRelease() {
         toast('This booking is no longer active.', true);
         closeCancelModal();
         return;
+      }
+      // Same guard as the admin path: releasing at or before the start minute
+      // sets end <= start, which bookingSpans() reads as overnight and turns
+      // the room into a 24-hour block. The server does not catch this — its
+      // check is `new_end < start`, and this case is exactly equal.
+      {
+        const n = new Date();
+        if (releaseWouldBeEmpty(b, todayStr(), n.getHours() * 60 + n.getMinutes())) {
+          toast('This booking has only just started — cancel it instead of releasing it.', true);
+          closeCancelModal();
+          return;
+        }
       }
       // Use the ACTUAL current date (not the booking's original date) for
       // endDate — correct whether released on its start day or, for an
