@@ -11,7 +11,7 @@
 import { ROOMS, roomName } from '../config.js';
 import { bookings } from '../state.js';
 import { minutesSinceMidnight, addDaysStr } from '../domain/time.js';
-import { findConflict } from '../domain/conflicts.js';
+import { getFreeRoomsForDate, findConflict } from '../domain/conflicts.js';
 import { fmtDate, fmtTime } from '../utils/formatting.js';
 import { escHtml, toast, showLoadingOverlay } from '../utils/dom-helpers.js';
 import { genId } from '../utils/ids.js';
@@ -23,12 +23,11 @@ import { renderTable, renderActiveNow, resetForm } from './admin-table.js';
 import { renderPendingRequests, updatePendingDot } from './pending-list.js';
 import { showRequestSuccess } from './request-form.js';
 
-function getFreeRoomsForDate(date, start, end, excludeRoom) {
-  return ROOMS.filter(r => {
-    if (r.id === excludeRoom) return false;
-    return !findConflict(r.id, date, start, end, null);
-  });
-}
+// Deliberately NOT redefined here. This used to be a local copy identical to
+// the one in domain/conflicts.js — two definitions of the same rule, which is
+// exactly how the two bulk-approve implementations drifted apart (one gained
+// a conflict check, the other did not).
+
 
 let _conflictSession = null;
 
@@ -74,7 +73,8 @@ export function renderConflictModal() {
   if (s.mode === 'adminApprove') {
     let html = '';
     s.items.forEach(it => {
-      const freeRooms = getFreeRoomsForDate(it.date, it.start, it.end, it.room);
+      // it.attendees so alternates that cannot seat the group are excluded.
+      const freeRooms = getFreeRoomsForDate(it.date, it.start, it.end, it.room, it.attendees);
       const chosen = s.resolutions[it.id];
       const blockClass = chosen === 'skip' ? '' : chosen === 'anyway' ? 'resolved' : chosen ? 'resolved' : 'has-conflict';
 
@@ -115,7 +115,7 @@ export function renderConflictModal() {
   }
 
   s.conflictDates.forEach(cd => {
-    const freeRooms = getFreeRoomsForDate(cd.date, s.start, s.end, s.room);
+    const freeRooms = getFreeRoomsForDate(cd.date, s.start, s.end, s.room, s.attendees);
     const chosen = s.resolutions[cd.date];
     const isSkipped = chosen === 'skip';
     const isResolved = chosen && chosen !== 'skip';
