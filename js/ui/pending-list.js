@@ -114,7 +114,7 @@ export async function approvePending(id) {
   const b = bookings[idx];
   const conflict = findConflict(b.room, b.date, b.start, b.end, id);
   if (conflict) {
-    openApprovalConflictModal([{ id: b.id, room: b.room, date: b.date, start: b.start, end: b.end, booker: b.booker, purpose: b.purpose, conflict }]);
+    openApprovalConflictModal([{ id: b.id, room: b.room, date: b.date, start: b.start, end: b.end, booker: b.booker, purpose: b.purpose, attendees: b.attendees, conflict }]);
     return;
   }
   try {
@@ -248,7 +248,7 @@ export async function bulkApprovePending() {
     const b = bookings.find(x => x.id === id);
     if (!b) continue;
     const conflict = findConflict(b.room, b.date, b.start, b.end, id);
-    if (conflict) conflictItems.push({ id: b.id, room: b.room, date: b.date, start: b.start, end: b.end, booker: b.booker, purpose: b.purpose, conflict });
+    if (conflict) conflictItems.push({ id: b.id, room: b.room, date: b.date, start: b.start, end: b.end, booker: b.booker, purpose: b.purpose, attendees: b.attendees, conflict });
     else cleanIds.push(id);
   }
 
