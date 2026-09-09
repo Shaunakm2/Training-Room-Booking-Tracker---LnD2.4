@@ -50,7 +50,11 @@ export function getFilteredBookings() {
     );
   }
   if (filterRoom) filtered = filtered.filter(b => b.room === filterRoom);
-  if (filterDate === 'today') filtered = filtered.filter(b => b.date === today);
+  // Spans, not the raw date. `b.date === today` excluded an overnight booking
+  // that started yesterday and is running RIGHT NOW — it showed as occupied
+  // on the room card and under Active Now, but vanished from the Today
+  // filter. Everything else in the app reasons in spans; this did not.
+  if (filterDate === 'today') filtered = filtered.filter(b => bookingSpans(b).some(sp => sp.date === today));
   else if (filterDate === 'upcoming') filtered = filtered.filter(b => bookingTimeStatus(b) !== 'past');
   else if (filterDate === 'past') filtered = filtered.filter(b => bookingTimeStatus(b) === 'past');
 
