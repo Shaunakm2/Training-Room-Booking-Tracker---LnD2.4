@@ -30,3 +30,14 @@ export const ADMIN_EMAIL = 'shaunakmistry4@gmail.com';
 export const TEAMS_NOTIFY_URL = 'https://xgrwmwibfkuxzkuuidsh.supabase.co/functions/v1/teams-notify';
 
 export const PAGE_SIZE = 15; // bookings per page in admin table
+
+// Maximum weekdays a single recurring booking may create.
+//
+// getWeekdays() was unbounded: a five-year range produced 1,305 rows from one
+// submission. The insert rate limiter no longer stops it either — it counts
+// transactions now, so a batch of any size is a single action. The browser
+// would also run dates x bookings conflict checks first and freeze.
+//
+// 65 is roughly a full quarter of weekdays, which covers every real recurring
+// training block. Anything longer is a scheduling decision, not a form entry.
+export const MAX_RECURRING_DATES = 65;
