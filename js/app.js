@@ -12,7 +12,7 @@
 import { bookings, adminLoggedIn } from './state.js';
 import { todayStr } from './domain/time.js';
 import { toast, updateClock } from './utils/dom-helpers.js';
-import { loadData } from './api/supabase-client.js';
+import { loadData, refreshIfChanged } from './api/supabase-client.js';
 import { doLogin, doLogout, closeLogin, requireAdmin, restoreSession, expireSession } from './api/auth.js';
 import { notifyTeams } from './api/notifications.js';
 
@@ -286,9 +286,12 @@ async function init() {
   initSunflowerListeners();
   initTimelineListeners();
 
+  // Every 60s: re-render (room cards and "ending soon" depend on the clock),
+  // but only re-DOWNLOAD bookings if something changed — refreshIfChanged()
+  // asks a tiny change-marker RPC first. See api/supabase-client.js.
   setInterval(async () => {
     if (document.hidden) return;
-    await loadData(true);
+    await refreshIfChanged();
     updatePendingDot();
     if (document.getElementById('page-status').classList.contains('active')) {
       renderStatusGrid();
@@ -317,7 +320,7 @@ async function init() {
 
   document.addEventListener('visibilitychange', async () => {
     if (!document.hidden) {
-      await loadData(true);
+      await refreshIfChanged();
       updatePendingDot();
       if (document.getElementById('page-status').classList.contains('active')) renderStatusGrid();
       if (document.getElementById('page-admin').classList.contains('active')) {

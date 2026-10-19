@@ -191,8 +191,15 @@ export async function confirmConflictResolution() {
         const idx = bookings.findIndex(b => b.id === item.id);
         if (idx === -1) continue;
         bookings[idx] = { ...bookings[idx], status: 'Confirmed', room: item.room || bookings[idx].room };
-        const b = bookings[idx];
-        notifyTeams({ event: 'approved', room: roomName(b.room), bookedBy: b.booker, purpose: b.purpose, date: b.date, start: fmtTime(b.start), end: fmtTime(b.end) });
+      }
+      // ONE Teams notification, not one per booking. A single approval keeps
+      // the detailed message; several use the same 'batchApproved' summary
+      // that bulk approve already sends (an event the Edge Function knows).
+      if (items.length === 1) {
+        const b = bookings.find(x => x.id === items[0].id);
+        if (b) notifyTeams({ event: 'approved', room: roomName(b.room), bookedBy: b.booker, purpose: b.purpose, date: b.date, start: fmtTime(b.start), end: fmtTime(b.end) });
+      } else if (items.length > 1) {
+        notifyTeams({ event: 'batchApproved', count: items.length });
       }
       let msg = `${items.length} request(s) approved ✅`;
       if (skipped > 0) msg += `, ${skipped} left Pending.`;

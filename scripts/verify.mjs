@@ -768,6 +768,25 @@ function stripNoise(src) {
       : ok('admin RPCs not executable by anon');
   }
 
+  // Background refreshes must go through the change marker, not re-download
+  // the whole table every minute. Pre-flight refreshes are deliberately exempt.
+  {
+    const app = stripComments(read('js/app.js'));
+    const client = stripComments(read('js/api/supabase-client.js'));
+    const problems = [];
+    if (/loadData\(true\)/.test(app)) problems.push('app.js still polls with loadData(true)');
+    if (!/refreshIfChanged\(/.test(app)) problems.push('app.js does not use refreshIfChanged()');
+    if (!/rpc\('bookings_change_marker'\)/.test(client)) problems.push('client does not read the marker');
+    const iMarker = client.search(/const marker = await readMarker\(\)/);
+    const iSelect = client.search(/\.from\('bookings'\)\s*\.select/);
+    if (iMarker === -1 || iSelect === -1 || iMarker > iSelect) problems.push('marker must be read BEFORE the rows');
+    if (!/create or replace function public\.bookings_change_marker/i.test(sql)) problems.push('marker function missing from schema');
+    else if (!/count\(\*\)/.test(fnBody('bookings_change_marker') || '')) problems.push('marker lacks the row count (late commits would be missed)');
+    problems.length
+      ? fail('background refresh only downloads on change', problems.join('; '))
+      : ok('background refresh only downloads on change');
+  }
+
   // Pre-flight refresh must FAIL CLOSED: deciding on stale data is the bug.
   {
     const bad = ['js/ui/request-form.js', 'js/ui/admin-table.js']

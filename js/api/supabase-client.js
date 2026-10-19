@@ -23,6 +23,44 @@ function writeRecentlyCompleted() {
   return (Date.now() - _writeCompletedAt) < 3000;
 }
 
+// ---- Change marker ----
+// The 60-second poll and every tab focus used to download the WHOLE bookings
+// table, even when nothing had changed. bookings_change_marker() (schema.sql
+// section 14h) returns two small counters that move on every booking change.
+// Background refreshes ask for it first and download bookings only when it
+// differs from the value seen at the last full load.
+//
+// Safety nets:
+//   - The marker is read BEFORE the rows. A change landing between the two
+//     is then included in the rows AND makes the next probe differ, so it
+//     costs at most one extra reload — it can never be missed.
+//   - If the marker cannot be read (network, or the SQL not deployed yet),
+//     the poll falls back to a full reload, i.e. the old behaviour.
+//   - A full reload still happens at least every FULL_RELOAD_MS regardless.
+// Pre-flight checks before a save do NOT use this: they always call
+// loadData(true, true) directly, because a decision is about to be made.
+const FULL_RELOAD_MS = 10 * 60 * 1000;
+let _lastMarker = null;      // JSON of the marker that matches `bookings`
+let _lastFullLoadAt = 0;
+
+async function readMarker() {
+  try {
+    const { data, error } = await supabase.rpc('bookings_change_marker');
+    if (error || data == null) return null;
+    return JSON.stringify(data);
+  } catch (_) {
+    return null;
+  }
+}
+
+// Background refresh. Returns true when bookings were re-downloaded.
+export async function refreshIfChanged() {
+  const marker = await readMarker();
+  const fresh = Date.now() - _lastFullLoadAt < FULL_RELOAD_MS;
+  if (marker !== null && marker === _lastMarker && fresh) return false;
+  return (await loadData(true)) === true;
+}
+
 // Returns true when fresh data was loaded, false when the fetch failed (the
 // previous data is kept). Pre-flight callers use this to refuse to make a
 // decision on stale data. Returns undefined when a silent poll was skipped by
@@ -39,6 +77,8 @@ export async function loadData(silent = false, force = false) {
   if (silent && !force && writeRecentlyCompleted()) return;
   try {
     if (!silent) showLoadingOverlay(true);
+    // Read BEFORE the rows — see the note on the change marker above.
+    const marker = await readMarker();
     const { data, error } = await supabase
       .from('bookings')
       .select('*')
@@ -98,6 +138,8 @@ export async function loadData(silent = false, force = false) {
     // rows to the top of "Recently Added" forever. That bug shipped twice.
     mapped.sort((a, b) => createdSortKey(b) - createdSortKey(a));
     setBookings(mapped);
+    _lastMarker = marker;
+    _lastFullLoadAt = Date.now();
     return true;
   } catch (e) {
     console.error('Load error', e);
