@@ -23,6 +23,11 @@ function writeRecentlyCompleted() {
   return (Date.now() - _writeCompletedAt) < 3000;
 }
 
+// Returns true when fresh data was loaded, false when the fetch failed (the
+// previous data is kept). Pre-flight callers use this to refuse to make a
+// decision on stale data. Returns undefined when a silent poll was skipped by
+// the write debounce — only possible without force=true.
+//
 // silent: no loading overlay, and subject to the write debounce.
 // force:  bypass the debounce. Use for a DELIBERATE pre-flight refresh before
 //         a conflict check — that is not the same thing as a background poll.
@@ -93,6 +98,7 @@ export async function loadData(silent = false, force = false) {
     // rows to the top of "Recently Added" forever. That bug shipped twice.
     mapped.sort((a, b) => createdSortKey(b) - createdSortKey(a));
     setBookings(mapped);
+    return true;
   } catch (e) {
     console.error('Load error', e);
     // Do NOT blank the list. This used to call setBookings([]), and since
@@ -104,6 +110,7 @@ export async function loadData(silent = false, force = false) {
     toast(silent
       ? 'Refresh failed — showing last known data.'
       : 'Could not load bookings. Check connection.', true);
+    return false;
   } finally {
     if (!silent) showLoadingOverlay(false);
   }

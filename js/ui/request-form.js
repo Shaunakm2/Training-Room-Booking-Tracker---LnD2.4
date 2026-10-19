@@ -12,7 +12,7 @@ import { showLoadingOverlay } from '../utils/dom-helpers.js';
 import { genId } from '../utils/ids.js';
 import { findAllConflicts } from '../domain/conflicts.js';
 import { loadData } from '../api/supabase-client.js';
-import { apiCreateRequestBatch } from '../api/bookings.js';
+import { apiCreateRequestBatch, newRequestKey, describeWriteError } from '../api/bookings.js';
 import { notifyTeams } from '../api/notifications.js';
 import { roomBadgesHtml } from './status-grid.js';
 import { openConflictModal } from './conflict-picker.js';
@@ -21,6 +21,15 @@ import { updatePendingDot } from './pending-list.js';
 
 let reqSubmitting = false;
 let _reqOpenedAt = 0; // bot-deterrence: timestamp when the request modal opened
+// One idempotency key per opening of the form. A double click, or retrying
+// after a dropped response, re-sends the same key and the server creates the
+// bookings only once. conflict-picker.js uses the same key for the
+// alternate-room path, via currentRequestKey().
+let _reqKey = null;
+export function currentRequestKey() {
+  if (!_reqKey) _reqKey = newRequestKey();
+  return _reqKey;
+}
 
 export function toggleReqRecurring() {
   const isRecurring = document.getElementById('req-recurring').checked;
@@ -46,6 +55,7 @@ export function updateReqCapacityHint() {
 
 export function openRequestModal(roomId) {
   _reqOpenedAt = Date.now(); // bot check: no human fills this form in under ~2s
+  _reqKey = newRequestKey();
   const sel = document.getElementById('req-room');
   sel.innerHTML = '<option value="">Select a room...</option>';
   for (const r of ROOMS) sel.innerHTML += `<option value="${r.id}">${r.name} (${r.floor})</option>`;
@@ -111,7 +121,22 @@ export function showRequestSuccess(newIds, conflictInfo) {
   updatePendingDot();
 }
 
+// Re-entrancy guard. The click handler is async and the pre-flight refresh
+// takes a moment, so a double click used to start two submissions. The
+// server's idempotency key would still create the bookings once, but this
+// stops the second run from reaching it at all.
+let _submitInFlight = false;
 export async function submitRequest() {
+  if (_submitInFlight) return;
+  _submitInFlight = true;
+  try {
+    await submitRequestInner();
+  } finally {
+    _submitInFlight = false;
+  }
+}
+
+async function submitRequestInner() {
   // Bot deterrence: a filled honeypot, or a submission completed
   // suspiciously fast, silently "succeeds" without actually creating a
   // booking — showing an error would teach a bot what tripped it.
@@ -165,13 +190,19 @@ export async function submitRequest() {
   }
   errEl.classList.remove('visible');
 
-  // Force fresh data before conflict check, to catch bookings made on
-  // other devices since this page loaded.
+  // Force fresh data before the conflict check, to catch bookings made on
+  // other devices since this page loaded. FAIL CLOSED: if the refresh fails,
+  // the conflict check would run on stale data, so stop and say so instead
+  // of submitting on the strength of old information.
+  let refreshed = false;
   try {
     showLoadingOverlay(true);
-    await loadData(true, true); // force: pre-flight, must not be debounced
-  } catch (e) { /* proceed with cached data if fetch fails */ }
-  finally { showLoadingOverlay(false); }
+    refreshed = await loadData(true, true); // force: pre-flight, must not be debounced
+  } finally { showLoadingOverlay(false); }
+  if (refreshed !== true) {
+    errEl.textContent = 'Could not check current availability. Please check your connection and try again.';
+    errEl.classList.add('visible'); return;
+  }
 
   const dates = isRecurring ? getWeekdays(date, dateEnd) : [date];
   if (dates.length === 0) {
@@ -212,8 +243,10 @@ export async function submitRequest() {
       const computedEndDate = minutesSinceMidnight(end) < minutesSinceMidnight(start) ? addDaysStr(d, 1) : d;
       return { id: genId(), room, booker, purpose, date: d, start, end, attendees: attendees || '', status: 'Pending', endDate: computedEndDate };
     });
-    await apiCreateRequestBatch(newBookings);
-    newBookings.forEach(b => bookings.push(b));
+    const res = await apiCreateRequestBatch(newBookings, currentRequestKey());
+    // A duplicate means these exact rows were already created by an earlier
+    // send of this same form; adding this attempt's ids would show phantoms.
+    if (!res.duplicate) newBookings.forEach(b => bookings.push(b));
 
     notifyTeams({
       event: isRecurring ? 'newRecurringRequest' : 'newRequest',
@@ -224,7 +257,7 @@ export async function submitRequest() {
 
     showRequestSuccess(newBookings.map(b => b.id), null);
   } catch (e) {
-    errEl.textContent = 'Error submitting request. Please try again.';
+    errEl.textContent = describeWriteError(e);
     errEl.classList.add('visible');
     reqSubmitting = false;
   } finally {

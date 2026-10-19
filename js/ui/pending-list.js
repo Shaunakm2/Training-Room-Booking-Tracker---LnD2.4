@@ -9,7 +9,7 @@ import { minutesSinceMidnight, addDaysStr, todayStr } from '../domain/time.js';
 import { getLiveConflicts, findConflict, formatLiveConflictNote } from '../domain/conflicts.js';
 import { fmtDate, fmtTime, displayPurpose } from '../utils/formatting.js';
 import { escHtml, toast, showLoadingOverlay, showConfirmModal } from '../utils/dom-helpers.js';
-import { apiUpdateStatus, apiUpdate, apiUpdateStatusBatch } from '../api/bookings.js';
+import { apiUpdateStatus, apiUpdate, apiUpdateStatusBatch, describeWriteError } from '../api/bookings.js';
 import { loadData } from '../api/supabase-client.js';
 import { notifyTeams } from '../api/notifications.js';
 import { openApprovalConflictModal } from './conflict-picker.js';
@@ -130,7 +130,7 @@ export async function approvePending(id) {
     // guessing: it is the source of truth, and this only costs a fetch on a
     // path that has already failed.
     await loadData();
-    toast('Could not approve the booking. No changes were saved.', true);
+    toast(describeWriteError(e), true);
   }
   finally { showLoadingOverlay(false); }
   renderPendingRequests(); renderTable(); renderStatusGrid(); updatePendingDot();
@@ -148,12 +148,15 @@ export async function modifyAndApprove(id) {
   if (minutesSinceMidnight(end) === minutesSinceMidnight(start)) { toast('Start and end time cannot be the same.', true); return; }
   const conflict = findConflict(room, date, start, end, id);
   if (conflict) { if (!(await showConfirmModal(`⚠️ Conflict: ${roomName(room)} is booked ${fmtTime(conflict.start)}–${fmtTime(conflict.end)} by ${conflict.booker}.\n\nApprove anyway?`, 'Approve Anyway', 'btn-modify'))) return; }
+  // The database refuses to confirm into an occupied slot unless told the
+  // admin chose to. Only pass the override when the admin just said so.
+  const overrideConflict = !!conflict;
   const modEndDate = minutesSinceMidnight(end) < minutesSinceMidnight(start) ? addDaysStr(date, 1) : date;
   const b = { ...bookings[idx], room, date, start, end, attendees: attendees || '', status: 'Confirmed', endDate: modEndDate };
   try {
     showLoadingOverlay(true);
     bookings[idx] = b;
-    await apiUpdate(b);
+    await apiUpdate(b, overrideConflict);
     toast('Booking modified & approved ✅');
     notifyTeams({ event: 'approved', room: roomName(b.room), bookedBy: b.booker, purpose: b.purpose, date: b.date, start: fmtTime(b.start), end: fmtTime(b.end) });
   } catch (e) {
@@ -163,7 +166,7 @@ export async function modifyAndApprove(id) {
     // guessing: it is the source of truth, and this only costs a fetch on a
     // path that has already failed.
     await loadData();
-    toast('Could not update the booking. No changes were saved.', true);
+    toast(describeWriteError(e), true);
   }
   finally { showLoadingOverlay(false); }
   renderPendingRequests(); renderTable(); renderStatusGrid(); updatePendingDot();
@@ -197,7 +200,7 @@ export async function confirmReject() {
     // guessing: it is the source of truth, and this only costs a fetch on a
     // path that has already failed.
     await loadData();
-    toast('Could not reject the request. No changes were saved.', true);
+    toast(describeWriteError(e), true);
   }
   finally { showLoadingOverlay(false); }
   renderPendingRequests(); renderTable(); renderStatusGrid(); updatePendingDot();
@@ -272,7 +275,7 @@ export async function bulkApprovePending() {
     // guessing: it is the source of truth, and this only costs a fetch on a
     // path that has already failed.
     await loadData();
-    toast('Bulk approve failed. No changes were saved.', true);
+    toast('Bulk approve failed — no bookings were changed. ' + describeWriteError(e), true);
   }
   finally { showLoadingOverlay(false); }
   renderPendingRequests(); renderTable(); renderStatusGrid(); updatePendingDot();
@@ -287,12 +290,13 @@ export async function bulkRejectPending() {
   showLoadingOverlay(true);
   let rejected = 0;
   try {
+    // ONE transaction for the whole selection: all rejected, or none.
+    await apiUpdateStatusBatch(ids, 'Rejected');
     for (const id of ids) {
       const idx = bookings.findIndex(b => b.id === id);
       if (idx !== -1) {
         const b = bookings[idx];
         bookings[idx].status = 'Rejected';
-        await apiUpdateStatus(id, 'Rejected');
         notifyTeams({ event: 'deletedOrRejected', room: roomName(b.room), bookedBy: b.booker, purpose: b.purpose, date: b.date, start: fmtTime(b.start), end: fmtTime(b.end) });
         rejected++;
       }
@@ -305,7 +309,7 @@ export async function bulkRejectPending() {
     // guessing: it is the source of truth, and this only costs a fetch on a
     // path that has already failed.
     await loadData();
-    toast('Bulk reject failed — some may have been rejected before the error. No changes were saved.', true);
+    toast('Bulk reject failed — no requests were changed. ' + describeWriteError(e), true);
   }
   finally { showLoadingOverlay(false); }
   renderPendingRequests(); renderTable(); renderStatusGrid(); updatePendingDot();

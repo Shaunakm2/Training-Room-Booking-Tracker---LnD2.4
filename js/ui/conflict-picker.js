@@ -16,12 +16,12 @@ import { fmtDate, fmtTime } from '../utils/formatting.js';
 import { escHtml, toast, showLoadingOverlay } from '../utils/dom-helpers.js';
 import { genId } from '../utils/ids.js';
 import { loadData } from '../api/supabase-client.js';
-import { apiCreate, apiUpdate, apiUpdateStatus, apiCreateRequestBatch } from '../api/bookings.js';
+import { apiCreateBatch, apiCreateRequestBatch, apiApproveWithResolutions, describeWriteError } from '../api/bookings.js';
 import { notifyTeams } from '../api/notifications.js';
 import { renderStatusGrid } from './status-grid.js';
 import { renderTable, renderActiveNow, resetForm } from './admin-table.js';
 import { renderPendingRequests, updatePendingDot } from './pending-list.js';
-import { showRequestSuccess } from './request-form.js';
+import { showRequestSuccess, currentRequestKey } from './request-form.js';
 
 // Deliberately NOT redefined here. This used to be a local copy identical to
 // the one in domain/conflicts.js — two definitions of the same rule, which is
@@ -170,34 +170,36 @@ export async function confirmConflictResolution() {
       return;
     }
     document.getElementById('conflict-modal').style.display = 'none';
+    // Build every resolution first, then send them as ONE transaction:
+    // either all chosen approvals happen, or none do. "anyway" carries an
+    // explicit override so the database accepts the overlap the admin chose.
+    const items = [];
+    let skipped = 0;
+    for (const it of s.items) {
+      const choice = s.resolutions[it.id];
+      if (choice === 'skip') { skipped++; continue; }
+      if (!bookings.some(b => b.id === it.id)) continue;
+      items.push(choice === 'anyway'
+        ? { id: it.id, room: null, override: true }
+        : { id: it.id, room: choice, override: false });
+    }
     try {
       showLoadingOverlay(true);
-      let approved = 0, skipped = 0;
-      for (const it of s.items) {
-        const choice = s.resolutions[it.id];
-        if (choice === 'skip') { skipped++; continue; }
-        const idx = bookings.findIndex(b => b.id === it.id);
+      if (items.length > 0) await apiApproveWithResolutions(items);
+      // Committed — now mirror it locally.
+      for (const item of items) {
+        const idx = bookings.findIndex(b => b.id === item.id);
         if (idx === -1) continue;
-        if (choice === 'anyway') {
-          bookings[idx].status = 'Confirmed';
-          await apiUpdateStatus(it.id, 'Confirmed');
-        } else {
-          const moved = { ...bookings[idx], room: choice, status: 'Confirmed' };
-          bookings[idx] = moved;
-          await apiUpdate(moved);
-        }
-        approved++;
-        notifyTeams({ event: 'approved', room: roomName(bookings[idx].room), bookedBy: bookings[idx].booker, purpose: bookings[idx].purpose, date: bookings[idx].date, start: fmtTime(bookings[idx].start), end: fmtTime(bookings[idx].end) });
+        bookings[idx] = { ...bookings[idx], status: 'Confirmed', room: item.room || bookings[idx].room };
+        const b = bookings[idx];
+        notifyTeams({ event: 'approved', room: roomName(b.room), bookedBy: b.booker, purpose: b.purpose, date: b.date, start: fmtTime(b.start), end: fmtTime(b.end) });
       }
-      let msg = `${approved} request(s) approved ✅`;
+      let msg = `${items.length} request(s) approved ✅`;
       if (skipped > 0) msg += `, ${skipped} left Pending.`;
       toast(msg);
     } catch (err) {
-      // Statuses were flipped locally before each write, and this loop can
-      // fail part-way through, so the local array is now an unreliable mix.
-      // Resync from the server rather than trying to reconstruct it.
       await loadData();
-      toast('Approval failed part-way. The list has been reloaded — check which requests went through.', true);
+      toast('Approval failed — no requests were changed. ' + describeWriteError(err), true);
     } finally {
       showLoadingOverlay(false);
     }
@@ -229,8 +231,8 @@ export async function confirmConflictResolution() {
         newBookings.push({ id: genId(), room: chosenRoom, booker: s.booker, purpose: s.purpose, date: cd.date, start: s.start, end: s.end, attendees: s.attendees || '', status: 'Pending', endDate: computedEndDate });
       }
       if (newBookings.length > 0) {
-        await apiCreateRequestBatch(newBookings);
-        newBookings.forEach(b => bookings.push(b));
+        const res = await apiCreateRequestBatch(newBookings, currentRequestKey());
+        if (!res.duplicate) newBookings.forEach(b => bookings.push(b));
       }
 
       const skipped = s.conflictDates.filter(cd => s.resolutions[cd.date] === 'skip').length;
@@ -254,7 +256,7 @@ export async function confirmConflictResolution() {
     } catch (err) {
       document.getElementById('request-modal').style.display = 'flex';
       const errEl = document.getElementById('req-error');
-      errEl.textContent = 'Error submitting request. Please try again.';
+      errEl.textContent = describeWriteError(err);
       errEl.classList.add('visible');
     } finally {
       showLoadingOverlay(false);
@@ -263,44 +265,38 @@ export async function confirmConflictResolution() {
     return;
   }
 
+  // All dates go to the server as ONE transaction: every booking is created,
+  // or none is. Rows are added locally only after the commit.
+  const rows = [];
+  for (const d of s.cleanDates) {
+    const computedEndDate = minutesSinceMidnight(s.end) < minutesSinceMidnight(s.start) ? addDaysStr(d, 1) : d;
+    rows.push({ id: genId(), room: s.room, booker: s.booker, purpose: s.purpose, date: d, start: s.start, end: s.end, attendees: s.attendees || '', status: 'Confirmed', endDate: computedEndDate });
+  }
+  for (const cd of s.conflictDates) {
+    const chosenRoom = s.resolutions[cd.date];
+    if (chosenRoom === 'skip') continue;
+    const computedEndDate = minutesSinceMidnight(s.end) < minutesSinceMidnight(s.start) ? addDaysStr(cd.date, 1) : cd.date;
+    rows.push({ id: genId(), room: chosenRoom, booker: s.booker, purpose: s.purpose, date: cd.date, start: s.start, end: s.end, attendees: s.attendees || '', status: 'Confirmed', endDate: computedEndDate });
+  }
+  let saved = false;
   try {
     showLoadingOverlay(true);
-    let count = 0;
-
-    for (const d of s.cleanDates) {
-      const computedEndDate = minutesSinceMidnight(s.end) < minutesSinceMidnight(s.start) ? addDaysStr(d, 1) : d;
-      const booking = { id: genId(), room: s.room, booker: s.booker, purpose: s.purpose, date: d, start: s.start, end: s.end, attendees: s.attendees || '', status: 'Confirmed', endDate: computedEndDate };
-      bookings.push(booking);
-      await apiCreate(booking);
-      count++;
-    }
-
-    for (const cd of s.conflictDates) {
-      const chosenRoom = s.resolutions[cd.date];
-      if (chosenRoom === 'skip') continue;
-      const computedEndDate = minutesSinceMidnight(s.end) < minutesSinceMidnight(s.start) ? addDaysStr(cd.date, 1) : cd.date;
-      const booking = { id: genId(), room: chosenRoom, booker: s.booker, purpose: s.purpose, date: cd.date, start: s.start, end: s.end, attendees: s.attendees || '', status: 'Confirmed', endDate: computedEndDate };
-      bookings.push(booking);
-      await apiCreate(booking);
-      count++;
-    }
-
+    if (rows.length > 0) await apiCreateBatch(rows);
+    rows.forEach(b => bookings.push(b));
+    saved = true;
     const skipped = s.conflictDates.filter(cd => s.resolutions[cd.date] === 'skip').length;
-    let msg = `${count} booking(s) created.`;
+    let msg = `${rows.length} booking(s) created.`;
     if (skipped > 0) msg += ` ${skipped} date(s) skipped.`;
     toast(msg);
   } catch (err) {
-    // Bookings were pushed locally before each insert and this loop can fail
-    // part-way, so some rows on screen may never have reached the database.
-    // Resync so the admin sees exactly what actually saved.
     await loadData();
-    toast('Some bookings could not be saved. The list has been reloaded — check which dates exist before retrying.', true);
+    toast('No bookings were created. ' + describeWriteError(err), true);
   } finally {
     showLoadingOverlay(false);
   }
-
   _conflictSession = null;
-  resetForm();
+  // Keep the admin's form on failure so they can adjust and retry.
+  if (saved) resetForm();
   renderTable();
   renderActiveNow();
   renderStatusGrid();

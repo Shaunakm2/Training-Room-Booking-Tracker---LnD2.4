@@ -248,24 +248,29 @@ function stripNoise(src) {
     ? ok('archive has created_at in schema')
     : fail('archive has created_at in schema', 'archive_old_bookings will fail');
 
-  // HIGH: the recurring-EDIT path must create replacements BEFORE deleting
-  // the original. Delete-first meant a mid-way failure destroyed the booking
-  // with nothing in its place and no way to reconstruct it.
+  // HIGH: the recurring EDIT must never be able to lose the original or leave
+  // duplicates. History: delete-first destroyed the booking on a mid-way
+  // failure; the fix (create first, delete last, best-effort clean-up) could
+  // still leave duplicates, and a dropped response could make the clean-up
+  // delete rows that had been saved. It is now ONE server transaction
+  // (replace_booking_atomic): the client must call that and nothing else.
   {
-    // stripNoise first: the explanatory comment in that block mentions
-    // apiDelete(id) by name, which made a naive indexOf report the delete as
-    // running first. The check was flagging its own documentation.
     const at = stripNoise(read('js/ui/admin-table.js'));
     const m = at.match(/if \(id && isRecurring\)[\s\S]*?\n  \}/);
+    const sqlNoComments = sql.replace(/--[^\n]*/g, ' ');
+    const fn = sqlNoComments.match(/function public\.replace_booking_atomic[\s\S]*?\$\$[\s\S]*?\$\$/i);
     if (!m) {
-      warn('recurring edit creates before deleting', 'could not locate the block');
+      warn('recurring edit is one transaction', 'could not locate the block');
     } else {
-      const iCreate = m[0].indexOf('apiCreate(');
-      const iDelete = m[0].indexOf('apiDelete(id)');
-      (iCreate !== -1 && iDelete !== -1 && iCreate < iDelete)
-        ? ok('recurring edit creates before deleting')
-        : fail('recurring edit creates before deleting',
-               'apiDelete(id) runs first — a failure destroys the original');
+      const problems = [];
+      if (!/apiReplaceRecurring\(/.test(m[0])) problems.push('admin-table does not call apiReplaceRecurring');
+      if (/apiDelete\(|apiCreate\(|apiCreateBatch\(/.test(m[0])) problems.push('client still issues separate create/delete calls');
+      if (!fn) problems.push('replace_booking_atomic missing from schema');
+      else if (!/delete from public\.bookings[\s\S]*create_bookings_atomic\(/i.test(fn[0]))
+        problems.push('replace_booking_atomic must delete then create inside the same function');
+      problems.length
+        ? fail('recurring edit is one transaction', problems.join('; '))
+        : ok('recurring edit is one transaction');
     }
   }
 
@@ -652,6 +657,127 @@ function stripNoise(src) {
     ? fail('form-control classes are element-qualified',
            `${bad.join(', ')} will lose to .form-group input/label`)
     : ok('form-control classes are element-qualified');
+}
+
+// ---------------------------------------------------------------
+// 4d. Audit trail, atomic writes, server-side conflicts (schema section 14).
+//     Each guard here protects a property that, if lost, fails silently:
+//     the app keeps working while partial saves, double bookings or missing
+//     audit rows creep back in.
+// ---------------------------------------------------------------
+{
+  const sqlRaw = read('supabase/schema.sql');
+  const sql = sqlRaw.replace(/--[^\n]*/g, ' ');
+  const api = stripComments(read('js/api/bookings.js'));
+  const fnBody = name => {
+    const m = sql.match(new RegExp(`function public\\.${name}\\s*\\([\\s\\S]*?\\$\\$([\\s\\S]*?)\\$\\$`, 'i'));
+    return m ? m[1] : null;
+  };
+
+  // Every RPC the client calls must exist in the schema.
+  {
+    const called = [...new Set([...api.matchAll(/(?:rpc|callRpc)\(\s*'([a-z_]+)'/g)].map(m => m[1]))];
+    const missing = called.filter(n => !new RegExp(`create\\s+or\\s+replace\\s+function\\s+public\\.${n}\\s*\\(`, 'i').test(sql));
+    missing.length
+      ? fail('every client RPC exists in schema', missing.join(', '))
+      : ok('every client RPC exists in schema', `${called.length} RPCs`);
+  }
+
+  // Booking writes from the browser go through atomic RPCs, never direct
+  // insert/update/delete on the table (apiSetConflictResolved is the single,
+  // single-row exception and is still audited by the trigger).
+  {
+    const direct = [...api.matchAll(/\.from\('bookings'\)\s*\.(insert|delete|update)\(/g)].map(m => m[1]);
+    const okDirect = direct.length === 1 && direct[0] === 'update'
+      && /apiSetConflictResolved[\s\S]{0,200}\.from\('bookings'\)\s*\.update\(\{\s*conflict_resolved/.test(api);
+    (direct.length === 0 || okDirect)
+      ? ok('booking writes use atomic RPCs')
+      : fail('booking writes use atomic RPCs', `direct table writes: ${direct.join(', ')}`);
+  }
+
+  // Audit trail: trigger on bookings, append-only, admin-read-only.
+  {
+    const problems = [];
+    if (!/create trigger trg_audit_booking_change\s+after insert or update or delete on public\.bookings/i.test(sql))
+      problems.push('audit trigger missing');
+    if (!/create trigger trg_audit_log_append_only\s+before update or delete on public\.booking_audit_log/i.test(sql))
+      problems.push('append-only trigger missing');
+    if (!/revoke all on public\.booking_audit_log from public, anon, authenticated/i.test(sql))
+      problems.push('audit table grants not revoked');
+    problems.length
+      ? fail('audit trail is complete and append-only', problems.join('; '))
+      : ok('audit trail is complete and append-only');
+  }
+
+  // Server-side overlap rule, with the admin override reset after use.
+  {
+    const problems = [];
+    if (!/create trigger trg_no_confirmed_overlap/i.test(sql)) problems.push('overlap trigger missing');
+    const t = fnBody('enforce_no_confirmed_overlap');
+    if (!t || !/pg_advisory_xact_lock/.test(t)) problems.push('overlap check is not serialised per room');
+    if (!t || !/v_new <@ v_old/.test(t)) problems.push('release-early of a shared room would be refused');
+    for (const n of ['create_bookings_atomic', 'update_booking_atomic',
+                     'update_booking_statuses_atomic', 'approve_bookings_atomic']) {
+      const b = fnBody(n);
+      if (!b) { problems.push(`${n} missing`); continue; }
+      if (/allow_booking_conflict',\s*'on'/.test(b) && !/allow_booking_conflict',\s*'off'/.test(b))
+        problems.push(`${n} turns the override on but never off`);
+    }
+    problems.length
+      ? fail('confirmed overlaps refused server-side', problems.join('; '))
+      : ok('confirmed overlaps refused server-side');
+  }
+
+  // Public create RPC must re-apply the public INSERT policy rules, because a
+  // SECURITY DEFINER function bypasses RLS.
+  {
+    const b = fnBody('create_bookings_atomic') || '';
+    const problems = [];
+    if (!/<>\s*'Pending'/.test(b)) problems.push('public can create non-Pending rows');
+    if (!/<\s*current_date/.test(b)) problems.push('public can backdate');
+    if (!/conflict_resolved/.test(b) || !/Conflict fields are admin-only/.test(b)) problems.push('public can set conflict fields');
+    if (!/booking_idempotency/.test(b)) problems.push('no idempotency');
+    problems.length
+      ? fail('public create RPC enforces public rules', problems.join('; '))
+      : ok('public create RPC enforces public rules');
+  }
+
+  // The batch limit in the RPC must allow the longest recurring range the UI
+  // permits, or every maximum-length recurring booking fails.
+  {
+    const cfg = read('js/config.js').match(/MAX_RECURRING_DATES\s*=\s*(\d+)/);
+    const lim = (fnBody('create_bookings_atomic') || '').match(/not between 1 and (\d+)/);
+    if (!cfg || !lim) {
+      warn('RPC batch limit covers MAX_RECURRING_DATES', 'could not read one of the two values');
+    } else {
+      Number(lim[1]) >= Number(cfg[1])
+        ? ok('RPC batch limit covers MAX_RECURRING_DATES', `${lim[1]} >= ${cfg[1]}`)
+        : fail('RPC batch limit covers MAX_RECURRING_DATES', `RPC allows ${lim[1]}, UI allows ${cfg[1]}`);
+    }
+  }
+
+  // Admin-only RPCs must be revoked from anon BY NAME. Supabase grants
+  // EXECUTE on new functions to anon directly, so revoking PUBLIC is not enough.
+  {
+    const missing = ['update_booking_atomic', 'update_booking_statuses_atomic',
+                     'approve_bookings_atomic', 'delete_bookings_atomic', 'replace_booking_atomic']
+      .filter(n => !new RegExp(`revoke all on function public\\.${n}\\([^)]*\\)\\s+from public, anon, authenticated`, 'i').test(sql)
+               || new RegExp(`grant execute on function public\\.${n}\\([^)]*\\)\\s+to[^;]*anon`, 'i').test(sql));
+    missing.length
+      ? fail('admin RPCs not executable by anon', missing.join(', '))
+      : ok('admin RPCs not executable by anon');
+  }
+
+  // Pre-flight refresh must FAIL CLOSED: deciding on stale data is the bug.
+  {
+    const bad = ['js/ui/request-form.js', 'js/ui/admin-table.js']
+      .filter(f => !/\(await loadData\(true, true\)\)\s*!==\s*true|refreshed\s*!==\s*true/.test(stripComments(read(f))));
+    const client = stripNoise(read('js/api/supabase-client.js'));
+    if (!/return true;/.test(client) || !/return false;/.test(client)) bad.push('supabase-client.js loadData does not report success');
+    bad.length
+      ? fail('pre-flight refresh fails closed', bad.join(', '))
+      : ok('pre-flight refresh fails closed');
+  }
 }
 
 // ---------------------------------------------------------------

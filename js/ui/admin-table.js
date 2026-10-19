@@ -17,7 +17,7 @@ import { fmtDate, fmtTime, displayPurpose } from '../utils/formatting.js';
 import { escHtml, toast, showLoadingOverlay, showConfirmModal } from '../utils/dom-helpers.js';
 import { genId } from '../utils/ids.js';
 import { loadData } from '../api/supabase-client.js';
-import { apiCreate, apiUpdate, apiDelete, apiUpdateStatusBatch } from '../api/bookings.js';
+import { apiCreateBatch, apiReplaceRecurring, apiUpdate, apiDelete, apiDeleteBatch, apiUpdateStatusBatch, describeWriteError } from '../api/bookings.js';
 import { notifyTeams } from '../api/notifications.js';
 import { roomBadgesHtml } from './status-grid.js';
 import { openConflictModal, openApprovalConflictModal } from './conflict-picker.js';
@@ -235,7 +235,11 @@ export async function adminReleaseEarly(bookingId) {
     toast('Room released — now available.');
     renderStatusGrid(); renderActiveNow(); renderTable();
   } catch (e) {
-    toast('Error — please try again.', true);
+    // b.end/b.endDate were changed locally before the write; reload so the
+    // screen matches the database again.
+    await loadData();
+    toast(describeWriteError(e), true);
+    renderStatusGrid(); renderActiveNow(); renderTable();
   } finally {
     showLoadingOverlay(false);
   }
@@ -387,7 +391,13 @@ export async function submitBooking(e) {
   // force=true: this is a pre-flight refresh for the conflict check below,
   // not a poll. Without it a save within 3s of the previous one silently
   // skipped the refresh and checked conflicts against stale data.
-  try { await loadData(true, true); } catch (e) {}
+  // FAIL CLOSED: if the refresh fails, the conflict check below would run on
+  // stale data. The database still refuses Confirmed overlaps, but pending
+  // overlaps are only visible here, so do not guess.
+  if ((await loadData(true, true)) !== true) {
+    showError('Could not refresh the booking list, so conflicts cannot be checked. Check your connection and try again.');
+    return;
+  }
 
   // Single booking edit (non-recurring)
   if (id && !isRecurring) {
@@ -422,7 +432,7 @@ export async function submitBooking(e) {
       editFailed = false;
     } catch (err) {
       editFailed = true;
-      showError('Could not save the booking — nothing was changed. Check your connection and try again.');
+      showError(describeWriteError(err));
     } finally { showLoadingOverlay(false); }
     // Only clear the form on success. resetForm() used to run
     // unconditionally, so a failed edit wiped the admin's typing AND showed
@@ -441,41 +451,32 @@ export async function submitBooking(e) {
       showError(`Conflicts on ${conflictDates.length} date(s): ${conflictDates.slice(0, 3).map(fmtDate).join(', ')}${conflictDates.length > 3 ? '…' : ''}. Resolve conflicts first.`);
       return;
     }
-    // ORDER MATTERS: create the replacements FIRST, delete the original LAST.
-    //
-    // This used to call apiDelete(id) up front. If the delete succeeded and
-    // any subsequent apiCreate failed — network blip, rate limit, a trigger
-    // rejection — the original booking was permanently gone with nothing in
-    // its place, and no local rollback could reconstruct it.
-    //
-    // Creating first makes the worst case orphaned duplicates, which the
-    // admin can see and delete, instead of an unrecoverable gap. The rule:
-    // destructive operations go last.
-    const createdRows = [];
+    // ONE transaction on the server (replace_booking_atomic): the original is
+    // removed and every replacement date created together. If any date fails
+    // — conflict, rate limit, validation, network — nothing changes and the
+    // original booking is exactly as it was. (The earlier client-side
+    // "create first, delete last, clean up on failure" sequence could leave
+    // duplicates, and a dropped response could make the clean-up delete
+    // bookings that had in fact been saved.)
+    const replacementRows = dates.map(d => ({
+      id: genId(), room, booker, purpose, date: d, start, end,
+      attendees: attendees || '', status: 'Confirmed',
+      endDate: minutesSinceMidnight(end) < minutesSinceMidnight(start) ? addDaysStr(d, 1) : d
+    }));
+    let recurringFailed = false;
     try {
       showLoadingOverlay(true);
-      for (const d of dates) {
-        const computedEndDate = minutesSinceMidnight(end) < minutesSinceMidnight(start) ? addDaysStr(d, 1) : d;
-        const booking = { id: genId(), room, booker, purpose, date: d, start, end, attendees: attendees || '', status: 'Confirmed', endDate: computedEndDate };
-        await apiCreate(booking);
-        createdRows.push(booking);
-        bookings.push(booking);
-      }
-      // Every replacement is committed, so it is now safe to remove the original.
-      await apiDelete(id);
-      setBookings(bookings.filter(b => b.id !== id));
+      await apiReplaceRecurring(id, replacementRows);
+      setBookings(bookings.filter(b => b.id !== id).concat(replacementRows));
       toast(`Booking updated across ${dates.length} date(s).`);
     } catch (err) {
-      // Best-effort cleanup of whatever we managed to create. If this also
-      // fails the original is still intact, so the admin is left with
-      // duplicates rather than a missing booking.
-      for (const c of createdRows) {
-        try { await apiDelete(c.id); } catch (_) {}
-      }
+      recurringFailed = true;
       await loadData();
-      showError('Could not update the recurring booking. The original has been left unchanged. The list was reloaded from the server — check it before retrying.');
+      showError('Could not update the recurring booking. The original has been left unchanged. ' + describeWriteError(err));
     } finally { showLoadingOverlay(false); }
-    resetForm(); renderTable(); renderActiveNow(); renderStatusGrid();
+    // Keep the admin's typing on failure so they can adjust and retry.
+    if (!recurringFailed) resetForm();
+    renderTable(); renderActiveNow(); renderStatusGrid();
     return;
   }
 
@@ -489,35 +490,24 @@ export async function submitBooking(e) {
   }
 
   if (conflictDates.length === 0) {
-    let created = 0;
+    // ONE transaction: every date is booked, or none is. Rows are added to the
+    // local list only after the server has committed them.
+    const newRows = dates.map(d => ({
+      id: genId(), room, booker, purpose, date: d, start, end,
+      attendees: attendees || '', status: 'Confirmed',
+      endDate: minutesSinceMidnight(end) < minutesSinceMidnight(start) ? addDaysStr(d, 1) : d
+    }));
     let failed = false;
     try {
       showLoadingOverlay(true);
-      for (const d of dates) {
-        const computedEndDate = minutesSinceMidnight(end) < minutesSinceMidnight(start) ? addDaysStr(d, 1) : d;
-        const booking = { id: genId(), room, booker, purpose, date: d, start, end, attendees: attendees || '', status: 'Confirmed', endDate: computedEndDate };
-        bookings.push(booking);
-        try {
-          await apiCreate(booking);
-          created++;
-        } catch (err) {
-          // ROLLBACK. The row was added to `bookings` optimistically so the
-          // table updates instantly, but the insert failed — so remove it
-          // again. Leaving it in place was the original bug: the booking
-          // looked saved, survived until the next loadData(), then vanished
-          // without trace because it had never reached the database.
-          setBookings(bookings.filter(b => b.id !== booking.id));
-          failed = true;
-          throw err;
-        }
-      }
+      await apiCreateBatch(newRows);
+      newRows.forEach(b => bookings.push(b));
       toast(dates.length === 1 ? 'Room booked successfully.' : `${dates.length} recurring bookings created (Mon–Fri).`);
     } catch (err) {
+      failed = true;
       // Deliberately an in-form error, not a toast. A toast auto-dismisses
       // and is easy to miss, which is how failed saves went unnoticed.
-      showError(created === 0
-        ? 'The booking was NOT saved. Nothing has been created — check your connection and try again.'
-        : `Only ${created} of ${dates.length} dates were saved. The unsaved dates have been removed from the list — retry those.`);
+      showError('The booking was NOT saved. ' + describeWriteError(err));
     } finally { showLoadingOverlay(false); }
     // Keep the form populated on failure so the admin doesn't have to retype
     // everything; only clear it once the save actually succeeded.
@@ -765,7 +755,7 @@ export async function bulkCancel() {
     });
     toast(`${ids.length} booking(s) cancelled.`);
     clearBulkSelection();
-  } catch (e) { toast('Error during bulk cancel.', true); }
+  } catch (e) { toast('Bulk cancel failed — nothing was changed. ' + describeWriteError(e), true); }
   finally { showLoadingOverlay(false); }
   renderTable(); renderActiveNow(); renderStatusGrid(); renderPendingRequests(); updatePendingDot();
 }
@@ -776,13 +766,13 @@ export async function bulkDelete() {
   if (!(await showConfirmModal(`Permanently delete ${ids.length} booking(s)? This cannot be undone.`, 'Delete Permanently', 'btn-danger'))) return;
   showLoadingOverlay(true);
   try {
-    for (const id of ids) {
-      await apiDelete(id);
-      setBookings(bookings.filter(b => b.id !== id));
-    }
+    // ONE transaction: all selected bookings are deleted, or none is.
+    await apiDeleteBatch(ids);
+    const gone = new Set(ids);
+    setBookings(bookings.filter(b => !gone.has(b.id)));
     toast(`${ids.length} booking(s) deleted.`);
     clearBulkSelection();
-  } catch (e) { toast('Error during bulk delete.', true); }
+  } catch (e) { toast('Bulk delete failed — nothing was deleted. ' + describeWriteError(e), true); }
   finally { showLoadingOverlay(false); }
   renderTable(); renderActiveNow(); renderStatusGrid(); renderPendingRequests();
 }

@@ -574,6 +574,15 @@ begin
   if auth.role() = 'authenticated' then
     return new;
   end if;
+  -- An UPDATE that changes neither the room nor the attendee count cannot
+  -- create a new capacity breach. Without this early return, a booking the
+  -- admin deliberately overbooked ("Book anyway") could never be cancelled or
+  -- released through the public self-service RPCs, because those UPDATE the
+  -- row as anon and the cap was re-applied to the unchanged headcount.
+  if tg_op = 'UPDATE' and new.room = old.room
+     and new.attendees is not distinct from old.attendees then
+    return new;
+  end if;
 
   -- SEAT COUNTS DUPLICATE js/config.js ROOMS. Kept as a CASE rather than a
   -- lookup table because the app reads capacity from config.js client-side;
@@ -853,7 +862,7 @@ $$;
 --
 -- What anon can execute. Expect true ONLY for base36_to_bigint,
 -- cancel_own_booking, release_own_booking, check_login_rate_limit,
--- log_failed_login:
+-- log_failed_login, create_bookings_atomic:
 --
 --   select p.proname, p.prosecdef as security_definer,
 --          has_function_privilege('anon', p.oid, 'execute') as anon_can_call
@@ -1052,3 +1061,648 @@ comment on view public.room_utilisation_monthly is
 --    (js/utils/ids.js creationMs) rather than reading created_at, which now
 --    exists and is backfilled. Switching over is a small change in
 --    supabase-client.js and filters-sort.js, after which creationMs can go.
+
+-- ============================================================
+-- 14. AUDIT TRAIL, ATOMIC WRITES, SERVER-SIDE CONFLICTS, CONSTRAINTS
+-- ============================================================
+-- Added 2026-10-20. Idempotent: safe to run on the live database, and safe to
+-- run again. Nothing here drops data. Run the WHOLE file, then run
+-- supabase/tests/atomic_audit_selftest.sql to prove it works.
+--
+-- What this section does:
+--   14a  Backfills end_date on legacy rows that have none.
+--   14b  Stronger CHECK constraints (enforced on every new/changed row).
+--   14c  Append-only audit trail of every INSERT/UPDATE/DELETE on bookings.
+--   14d  Server-side overlap rule for Confirmed bookings (race-safe).
+--   14e  Idempotency keys so a retried/double submission is created once.
+--   14f  Atomic RPCs: every multi-row write is ONE transaction — it either
+--        fully succeeds or changes nothing.
+--
+-- CONFLICT OVERRIDE: the admin can still confirm a booking into an occupied
+-- slot ("Approve anyway"). The RPC sets the transaction-local flag
+-- app.allow_booking_conflict only when the caller is the admin AND asked for
+-- it explicitly, and resets it before returning. The override is recorded in
+-- the audit trail like every other change.
+
+-- ------------------------------------------------------------
+-- 14a. Backfill end_date (legacy rows only)
+-- ------------------------------------------------------------
+-- The new end_date constraint requires a value. Rows written by the current
+-- app always have one; only very old rows can be NULL. Per-row with its own
+-- exception block so one odd legacy row is reported, not fatal.
+do $$
+declare
+  r record;
+begin
+  perform set_config('app.allow_booking_conflict', 'on', true);
+  for r in select booking_id from public.bookings where end_date is null loop
+    begin
+      update public.bookings
+         set end_date = case when end_time > start_time
+                             then booking_date else booking_date + 1 end
+       where booking_id = r.booking_id;
+    exception when others then
+      raise notice 'end_date backfill skipped for %: %', r.booking_id, sqlerrm;
+    end;
+  end loop;
+  perform set_config('app.allow_booking_conflict', 'off', true);
+end $$;
+
+-- ------------------------------------------------------------
+-- 14b. Constraints
+-- ------------------------------------------------------------
+-- NOT VALID = enforced on every INSERT and every UPDATE from now on, but
+-- existing rows are not re-checked when the constraint is added. That keeps
+-- this file runnable even if old data is untidy. To make them fully
+-- validated, run the diagnostic at the end of section 14 and then the
+-- VALIDATE statements listed there.
+--
+-- Length rules already enforced by section 1 (booked_by <= 80,
+-- purpose <= 100, attendees 1..500) are not repeated.
+alter table public.bookings drop constraint if exists bookings_booked_by_nonblank;
+alter table public.bookings add constraint bookings_booked_by_nonblank
+  check (length(btrim(booked_by)) >= 1) not valid;
+
+alter table public.bookings drop constraint if exists bookings_conflict_note_length;
+alter table public.bookings add constraint bookings_conflict_note_length
+  check (conflict_note is null or char_length(conflict_note) <= 500) not valid;
+
+alter table public.bookings drop constraint if exists bookings_end_date_valid;
+alter table public.bookings add constraint bookings_end_date_valid
+  check (end_date is not null
+         and end_date between booking_date and booking_date + 1) not valid;
+
+alter table public.bookings drop constraint if exists bookings_positive_duration;
+alter table public.bookings add constraint bookings_positive_duration
+  check ((end_date + end_time) > (booking_date + start_time)) not valid;
+
+alter table public.bookings drop constraint if exists bookings_max_duration;
+alter table public.bookings add constraint bookings_max_duration
+  check ((end_date + end_time) <= (booking_date + start_time + interval '24 hours')) not valid;
+
+-- Earlier draft of this change had a separate purpose-length constraint; it
+-- duplicated the column CHECK. Removed if present.
+alter table public.bookings drop constraint if exists bookings_purpose_length;
+
+-- ------------------------------------------------------------
+-- 14c. Audit trail
+-- ------------------------------------------------------------
+create table if not exists public.booking_audit_log (
+  audit_id       bigint generated always as identity primary key,
+  booking_id     text not null,
+  action         text not null check (action in ('INSERT','UPDATE','DELETE')),
+  actor_role     text not null,
+  actor_id       uuid,
+  actor_email    text,
+  client_ip      inet,
+  occurred_at    timestamptz not null default now(),
+  transaction_id bigint not null,
+  old_row        jsonb,
+  new_row        jsonb
+);
+create index if not exists booking_audit_booking_time_idx
+  on public.booking_audit_log (booking_id, occurred_at desc);
+create index if not exists booking_audit_time_idx
+  on public.booking_audit_log (occurred_at desc);
+
+alter table public.booking_audit_log enable row level security;
+drop policy if exists "Admin can view booking audit" on public.booking_audit_log;
+create policy "Admin can view booking audit"
+  on public.booking_audit_log for select
+  to authenticated
+  using (public.is_admin());
+-- Supabase default privileges grant ALL on new public tables to anon and
+-- authenticated. Strip that; the admin gets read-only, nobody gets write.
+revoke all on public.booking_audit_log from public, anon, authenticated;
+grant select on public.booking_audit_log to authenticated;
+
+-- Written by the trigger below. SECURITY DEFINER so it can insert into a
+-- table no client can write to. auth.role()/auth.jwt() read the request's
+-- JWT claims, so they still identify the real caller inside a definer.
+create or replace function public.audit_booking_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  insert into public.booking_audit_log
+    (booking_id, action, actor_role, actor_id, actor_email, client_ip,
+     transaction_id, old_row, new_row)
+  values
+    (coalesce(new.booking_id, old.booking_id),
+     tg_op,
+     coalesce(auth.role(), 'database'),
+     auth.uid(),
+     auth.jwt() ->> 'email',
+     public.client_ip(),
+     txid_current(),
+     case when tg_op in ('UPDATE','DELETE') then to_jsonb(old) end,
+     case when tg_op in ('INSERT','UPDATE') then to_jsonb(new) end);
+  return coalesce(new, old);
+end;
+$$;
+drop trigger if exists trg_audit_booking_change on public.bookings;
+create trigger trg_audit_booking_change
+  after insert or update or delete on public.bookings
+  for each row execute function public.audit_booking_change();
+
+-- Append-only: rows can never be edited or deleted, by anyone, including
+-- service_role (which bypasses RLS but not triggers).
+create or replace function public.audit_log_is_append_only()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  raise exception 'booking_audit_log is append-only.' using errcode = '42501';
+end;
+$$;
+drop trigger if exists trg_audit_log_append_only on public.booking_audit_log;
+create trigger trg_audit_log_append_only
+  before update or delete on public.booking_audit_log
+  for each row execute function public.audit_log_is_append_only();
+
+revoke all on function public.audit_booking_change()     from public, anon, authenticated;
+revoke all on function public.audit_log_is_append_only() from public, anon, authenticated;
+
+-- ------------------------------------------------------------
+-- 14d. Server-side overlap rule for Confirmed bookings
+-- ------------------------------------------------------------
+-- Real end of a booking. Mirrors bookingSpans() in js/domain/time.js:
+-- end <= start means the booking runs into the next day.
+create or replace function public.booking_end_ts(
+  p_date date, p_start time, p_end time, p_end_date date
+)
+returns timestamp
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select case
+           when coalesce(p_end_date, p_date) + p_end > p_date + p_start
+             then coalesce(p_end_date, p_date) + p_end
+           else (p_date + 1) + p_end
+         end
+$$;
+revoke all on function public.booking_end_ts(date, time, time, date) from public, anon, authenticated;
+
+create or replace function public.enforce_no_confirmed_overlap()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_new      tsrange;
+  v_old      tsrange;
+  v_conflict text;
+begin
+  -- Only Confirmed bookings occupy a room. Pending/Cancelled/Rejected never
+  -- block anything here (the UI still warns about pending overlaps).
+  if new.status <> 'Confirmed' then
+    return new;
+  end if;
+  -- Explicit admin override for this transaction only.
+  if coalesce(current_setting('app.allow_booking_conflict', true), 'off') = 'on' then
+    return new;
+  end if;
+
+  v_new := tsrange(new.booking_date + new.start_time,
+                   public.booking_end_ts(new.booking_date, new.start_time,
+                                         new.end_time, new.end_date), '[)');
+
+  -- Shortening a Confirmed booking in the same room (Release Early) cannot
+  -- create a new clash. Without this, a room two people already share by an
+  -- admin "Approve anyway" could never be released.
+  if tg_op = 'UPDATE' and old.status = 'Confirmed' and old.room = new.room then
+    v_old := tsrange(old.booking_date + old.start_time,
+                     public.booking_end_ts(old.booking_date, old.start_time,
+                                           old.end_time, old.end_date), '[)');
+    if v_new <@ v_old then
+      return new;
+    end if;
+  end if;
+
+  -- Serialise competing writes for the same room. Held until COMMIT, so a
+  -- second transaction waits and then sees the first one's committed row.
+  perform pg_advisory_xact_lock(hashtextextended('ldrooms:' || new.room, 0));
+
+  select b.booking_id into v_conflict
+    from public.bookings b
+   where b.room = new.room
+     and b.status = 'Confirmed'
+     and b.booking_id <> new.booking_id
+     and b.booking_date between new.booking_date - 1 and new.booking_date + 1
+     and tsrange(b.booking_date + b.start_time,
+                 public.booking_end_ts(b.booking_date, b.start_time,
+                                       b.end_time, b.end_date), '[)') && v_new
+   limit 1;
+
+  if v_conflict is not null then
+    raise exception 'ROOM_CONFLICT: room % is already booked at this time (booking %).',
+      new.room, v_conflict
+      using errcode = '23P01';
+  end if;
+  return new;
+end;
+$$;
+revoke all on function public.enforce_no_confirmed_overlap() from public, anon, authenticated;
+drop trigger if exists trg_no_confirmed_overlap on public.bookings;
+create trigger trg_no_confirmed_overlap
+  before insert or update of room, booking_date, start_time, end_time, end_date, status
+  on public.bookings
+  for each row execute function public.enforce_no_confirmed_overlap();
+
+-- ------------------------------------------------------------
+-- 14e. Idempotency
+-- ------------------------------------------------------------
+-- The browser sends one random key per submission. A second call with the
+-- same key (double click, retry after a dropped response, second tab)
+-- returns the first result instead of creating the bookings again. If the
+-- first attempt failed, its key row was rolled back with it, so a retry is
+-- processed normally.
+create table if not exists public.booking_idempotency (
+  actor_key   text not null,
+  request_key text not null,
+  response    jsonb,
+  created_at  timestamptz not null default now(),
+  primary key (actor_key, request_key)
+);
+alter table public.booking_idempotency enable row level security;
+-- RLS ON WITH ZERO POLICIES IS INTENTIONAL (see booking_rate_log, section 6).
+revoke all on public.booking_idempotency from public, anon, authenticated;
+
+create or replace function public.booking_actor_key()
+returns text
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  select case when auth.role() = 'authenticated'
+              then 'auth:' || coalesce(auth.uid()::text, 'unknown')
+              else 'ip:'   || coalesce(public.client_ip()::text, 'unknown')
+         end
+$$;
+revoke all on function public.booking_actor_key() from public, anon, authenticated;
+
+-- ------------------------------------------------------------
+-- 14f. Atomic RPCs
+-- ------------------------------------------------------------
+-- Each RPC call from the browser is one database transaction. Any error
+-- inside rolls back every row it touched.
+
+-- Create 1..100 bookings. Public callers: Pending only, no past dates, no
+-- conflict fields — the same rules as the "Public can create pending
+-- requests" policy, re-checked here because SECURITY DEFINER bypasses RLS.
+-- Admin callers: any status; p_allow_conflicts overrides the overlap rule.
+create or replace function public.create_bookings_atomic(
+  p_rows            jsonb,
+  p_request_key     text,
+  p_allow_conflicts boolean default false
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_is_admin boolean := coalesce(auth.role() = 'authenticated' and public.is_admin(), false);
+  v_actor    text;
+  v_response jsonb;
+  v_count    integer := 0;
+  v_status   text;
+  r          jsonb;
+begin
+  if auth.role() = 'authenticated' and not v_is_admin then
+    raise exception 'Admin access required.' using errcode = '42501';
+  end if;
+  if p_request_key is null or p_request_key !~ '^[A-Za-z0-9_-]{16,100}$' then
+    raise exception 'Invalid request key.' using errcode = '22023';
+  end if;
+  if p_rows is null or jsonb_typeof(p_rows) <> 'array'
+     or jsonb_array_length(p_rows) not between 1 and 100 then
+    raise exception 'A request must contain between 1 and 100 bookings.' using errcode = '22023';
+  end if;
+  if coalesce(p_allow_conflicts, false) and not v_is_admin then
+    raise exception 'Only the admin can override a conflict.' using errcode = '42501';
+  end if;
+
+  v_actor := public.booking_actor_key();
+  delete from public.booking_idempotency where created_at < now() - interval '24 hours';
+  insert into public.booking_idempotency (actor_key, request_key)
+  values (v_actor, p_request_key)
+  on conflict do nothing;
+  if not found then
+    select response into v_response
+      from public.booking_idempotency
+     where actor_key = v_actor and request_key = p_request_key;
+    return coalesce(v_response, jsonb_build_object('ok', true, 'created', 0))
+           || jsonb_build_object('duplicate', true);
+  end if;
+
+  if coalesce(p_allow_conflicts, false) then
+    perform set_config('app.allow_booking_conflict', 'on', true);
+  end if;
+
+  for r in select value from jsonb_array_elements(p_rows) loop
+    v_status := coalesce(nullif(r ->> 'status', ''), 'Pending');
+    if not v_is_admin then
+      if v_status <> 'Pending' then
+        raise exception 'Requests are created as Pending.' using errcode = '42501';
+      end if;
+      if (r ->> 'booking_date')::date < current_date then
+        raise exception 'Bookings cannot be made for a past date.' using errcode = '22023';
+      end if;
+      if coalesce((r ->> 'conflict_resolved')::boolean, false)
+         or coalesce(r ->> 'conflict_note', '') <> '' then
+        raise exception 'Conflict fields are admin-only.' using errcode = '42501';
+      end if;
+    end if;
+
+    insert into public.bookings
+      (booking_id, room, booked_by, purpose, booking_date, start_time, end_time,
+       attendees, status, end_date, conflict_resolved, conflict_note)
+    values
+      (r ->> 'booking_id',
+       r ->> 'room',
+       btrim(r ->> 'booked_by'),
+       coalesce(btrim(r ->> 'purpose'), ''),
+       (r ->> 'booking_date')::date,
+       (r ->> 'start_time')::time,
+       (r ->> 'end_time')::time,
+       nullif(r ->> 'attendees', '')::integer,
+       v_status,
+       (r ->> 'end_date')::date,
+       coalesce((r ->> 'conflict_resolved')::boolean, false),
+       coalesce(r ->> 'conflict_note', ''));
+    v_count := v_count + 1;
+  end loop;
+
+  perform set_config('app.allow_booking_conflict', 'off', true);
+
+  v_response := jsonb_build_object('ok', true, 'created', v_count, 'duplicate', false);
+  update public.booking_idempotency
+     set response = v_response
+   where actor_key = v_actor and request_key = p_request_key;
+  return v_response;
+end;
+$$;
+
+-- Update one booking (admin edit, release early, move to another room).
+create or replace function public.update_booking_atomic(
+  p_row             jsonb,
+  p_allow_conflicts boolean default false
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_count integer;
+begin
+  if not coalesce(auth.role() = 'authenticated' and public.is_admin(), false) then
+    raise exception 'Admin access required.' using errcode = '42501';
+  end if;
+  if p_row is null or jsonb_typeof(p_row) <> 'object' or coalesce(p_row ->> 'booking_id', '') = '' then
+    raise exception 'Booking data is required.' using errcode = '22023';
+  end if;
+  if coalesce(p_allow_conflicts, false) then
+    perform set_config('app.allow_booking_conflict', 'on', true);
+  end if;
+
+  update public.bookings
+     set room              = p_row ->> 'room',
+         booked_by         = btrim(p_row ->> 'booked_by'),
+         purpose           = coalesce(btrim(p_row ->> 'purpose'), ''),
+         booking_date      = (p_row ->> 'booking_date')::date,
+         start_time        = (p_row ->> 'start_time')::time,
+         end_time          = (p_row ->> 'end_time')::time,
+         attendees         = nullif(p_row ->> 'attendees', '')::integer,
+         status            = coalesce(nullif(p_row ->> 'status', ''), 'Confirmed'),
+         end_date          = (p_row ->> 'end_date')::date,
+         conflict_resolved = coalesce((p_row ->> 'conflict_resolved')::boolean, false),
+         conflict_note     = coalesce(p_row ->> 'conflict_note', '')
+   where booking_id = p_row ->> 'booking_id';
+  get diagnostics v_count = row_count;
+
+  perform set_config('app.allow_booking_conflict', 'off', true);
+
+  if v_count <> 1 then
+    raise exception 'Booking % no longer exists.', p_row ->> 'booking_id' using errcode = 'P0002';
+  end if;
+  return jsonb_build_object('ok', true, 'updated', v_count);
+end;
+$$;
+
+-- Set one status on many bookings (approve / reject / cancel, single or bulk).
+create or replace function public.update_booking_statuses_atomic(
+  p_ids             text[],
+  p_status          text,
+  p_allow_conflicts boolean default false
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_ids   text[];
+  v_count integer;
+begin
+  if not coalesce(auth.role() = 'authenticated' and public.is_admin(), false) then
+    raise exception 'Admin access required.' using errcode = '42501';
+  end if;
+  if p_status is null or p_status not in ('Confirmed','Pending','Cancelled','Rejected') then
+    raise exception 'Invalid status.' using errcode = '22023';
+  end if;
+  select array_agg(distinct x) into v_ids from unnest(p_ids) as x where x is not null;
+  if v_ids is null or cardinality(v_ids) not between 1 and 500 then
+    raise exception 'Between 1 and 500 bookings must be selected.' using errcode = '22023';
+  end if;
+  if coalesce(p_allow_conflicts, false) then
+    perform set_config('app.allow_booking_conflict', 'on', true);
+  end if;
+
+  update public.bookings set status = p_status where booking_id = any(v_ids);
+  get diagnostics v_count = row_count;
+
+  perform set_config('app.allow_booking_conflict', 'off', true);
+
+  if v_count <> cardinality(v_ids) then
+    raise exception 'One or more selected bookings no longer exist. Nothing was changed.' using errcode = 'P0002';
+  end if;
+  return jsonb_build_object('ok', true, 'updated', v_count);
+end;
+$$;
+
+-- Approve a set of conflicting requests in one go, each with its own
+-- resolution: move to another room, or approve anyway (override).
+-- p_items: [{"booking_id": "...", "room": "<room id or null>", "override": true|false}]
+create or replace function public.approve_bookings_atomic(p_items jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  it      jsonb;
+  v_count integer;
+  v_total integer := 0;
+begin
+  if not coalesce(auth.role() = 'authenticated' and public.is_admin(), false) then
+    raise exception 'Admin access required.' using errcode = '42501';
+  end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array'
+     or jsonb_array_length(p_items) not between 1 and 500 then
+    raise exception 'Between 1 and 500 bookings must be supplied.' using errcode = '22023';
+  end if;
+
+  for it in select value from jsonb_array_elements(p_items) loop
+    perform set_config('app.allow_booking_conflict',
+                       case when coalesce((it ->> 'override')::boolean, false) then 'on' else 'off' end,
+                       true);
+    update public.bookings
+       set status = 'Confirmed',
+           room   = coalesce(nullif(it ->> 'room', ''), room)
+     where booking_id = it ->> 'booking_id';
+    get diagnostics v_count = row_count;
+    if v_count <> 1 then
+      perform set_config('app.allow_booking_conflict', 'off', true);
+      raise exception 'Booking % no longer exists. Nothing was changed.', it ->> 'booking_id'
+        using errcode = 'P0002';
+    end if;
+    v_total := v_total + 1;
+  end loop;
+
+  perform set_config('app.allow_booking_conflict', 'off', true);
+  return jsonb_build_object('ok', true, 'approved', v_total);
+end;
+$$;
+
+-- Permanently delete many bookings (the audit trail keeps a copy).
+create or replace function public.delete_bookings_atomic(p_ids text[])
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_ids   text[];
+  v_count integer;
+begin
+  if not coalesce(auth.role() = 'authenticated' and public.is_admin(), false) then
+    raise exception 'Admin access required.' using errcode = '42501';
+  end if;
+  select array_agg(distinct x) into v_ids from unnest(p_ids) as x where x is not null;
+  if v_ids is null or cardinality(v_ids) not between 1 and 500 then
+    raise exception 'Between 1 and 500 bookings must be selected.' using errcode = '22023';
+  end if;
+  delete from public.bookings where booking_id = any(v_ids);
+  get diagnostics v_count = row_count;
+  if v_count <> cardinality(v_ids) then
+    raise exception 'One or more selected bookings no longer exist. Nothing was deleted.' using errcode = 'P0002';
+  end if;
+  return jsonb_build_object('ok', true, 'deleted', v_count);
+end;
+$$;
+
+-- Recurring edit: replace one booking with a set of dated bookings, as ONE
+-- transaction. The original is removed first INSIDE the transaction so the
+-- replacement for its own slot does not clash with it; if any replacement
+-- fails, the delete is rolled back too and the original is untouched.
+create or replace function public.replace_booking_atomic(
+  p_original_id text,
+  p_rows        jsonb,
+  p_request_key text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_result jsonb;
+begin
+  if not coalesce(auth.role() = 'authenticated' and public.is_admin(), false) then
+    raise exception 'Admin access required.' using errcode = '42501';
+  end if;
+
+  -- Same key already completed: return that result rather than failing on
+  -- an original that the first call already removed.
+  select response into v_result
+    from public.booking_idempotency
+   where actor_key = public.booking_actor_key()
+     and request_key = p_request_key
+     and response is not null;
+  if found then
+    return v_result || jsonb_build_object('duplicate', true, 'replaced', p_original_id);
+  end if;
+
+  perform 1 from public.bookings where booking_id = p_original_id for update;
+  if not found then
+    raise exception 'The original booking no longer exists.' using errcode = 'P0002';
+  end if;
+
+  delete from public.bookings where booking_id = p_original_id;
+  v_result := public.create_bookings_atomic(p_rows, p_request_key, false);
+  return v_result || jsonb_build_object('replaced', p_original_id);
+end;
+$$;
+
+-- Grants. Supabase's default privileges grant EXECUTE on new functions to
+-- anon and authenticated directly, so revoking from PUBLIC alone is not
+-- enough — each role is revoked by name and then granted back explicitly.
+revoke all on function public.create_bookings_atomic(jsonb, text, boolean)         from public, anon, authenticated;
+revoke all on function public.update_booking_atomic(jsonb, boolean)                from public, anon, authenticated;
+revoke all on function public.update_booking_statuses_atomic(text[], text, boolean) from public, anon, authenticated;
+revoke all on function public.approve_bookings_atomic(jsonb)                       from public, anon, authenticated;
+revoke all on function public.delete_bookings_atomic(text[])                       from public, anon, authenticated;
+revoke all on function public.replace_booking_atomic(text, jsonb, text)            from public, anon, authenticated;
+
+-- Public booking requests go through this one (Pending only, enforced inside).
+grant execute on function public.create_bookings_atomic(jsonb, text, boolean)         to anon, authenticated;
+-- Everything else: authenticated role only, and is_admin() checked inside.
+grant execute on function public.update_booking_atomic(jsonb, boolean)                to authenticated;
+grant execute on function public.update_booking_statuses_atomic(text[], text, boolean) to authenticated;
+grant execute on function public.approve_bookings_atomic(jsonb)                       to authenticated;
+grant execute on function public.delete_bookings_atomic(text[])                       to authenticated;
+grant execute on function public.replace_booking_atomic(text, jsonb, text)            to authenticated;
+
+-- ------------------------------------------------------------
+-- 14g. Optional: fully validate the constraints for old rows
+-- ------------------------------------------------------------
+-- 1) Find legacy rows that break the new rules (expect zero rows):
+--
+--   select booking_id, booked_by, booking_date, start_time, end_time, end_date, status
+--   from public.bookings
+--   where length(btrim(booked_by)) < 1
+--      or (conflict_note is not null and char_length(conflict_note) > 500)
+--      or end_date is null
+--      or end_date not between booking_date and booking_date + 1
+--      or (end_date + end_time) <= (booking_date + start_time)
+--      or (end_date + end_time) >  (booking_date + start_time + interval '24 hours');
+--
+--    Any row listed here cannot be approved/edited until it is corrected
+--    (or deleted), because every UPDATE is checked against the new rules.
+--
+-- 2) When step 1 returns zero rows:
+--
+--   alter table public.bookings validate constraint bookings_booked_by_nonblank;
+--   alter table public.bookings validate constraint bookings_conflict_note_length;
+--   alter table public.bookings validate constraint bookings_end_date_valid;
+--   alter table public.bookings validate constraint bookings_positive_duration;
+--   alter table public.bookings validate constraint bookings_max_duration;
+--
+-- 3) Read the audit trail (admin, SQL editor):
+--
+--   select occurred_at, action, booking_id, actor_role, actor_email, client_ip,
+--          old_row ->> 'status' as old_status, new_row ->> 'status' as new_status
+--   from public.booking_audit_log
+--   order by occurred_at desc
+--   limit 100;
+
+-- Make the new RPCs visible to the API immediately (harmless if already
+-- reloaded automatically).
+notify pgrst, 'reload schema';
