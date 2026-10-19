@@ -1,6 +1,6 @@
 // js/api/bookings.js
 // Every booking write goes through a Postgres RPC that runs as ONE
-// transaction (see supabase/schema.sql section 14). A multi-row action either
+// transaction (see supabase/schema.sql section 7). A multi-row action either
 // fully succeeds or changes nothing — there is no partial-save state for the
 // UI to reconcile. The database also enforces the Confirmed-overlap rule and
 // writes the audit trail, so neither depends on this file being correct.
@@ -42,7 +42,14 @@ function toRow(b, statusOverride) {
 
 async function callRpc(name, args) {
   const { data, error } = await supabase.rpc(name, args);
-  if (error) throw error;
+  if (error) {
+    // 42501 from an admin call while the UI thinks it is signed in means the
+    // server has ended the session (idle limit, or signed out elsewhere).
+    // app.js listens and signs the browser out, instead of leaving a panel
+    // whose every save fails.
+    if (error.code === '42501') window.dispatchEvent(new CustomEvent('ldrooms:admin-session-invalid'));
+    throw error;
+  }
   if (!data || data.ok !== true) throw new Error((data && data.error) || `${name} failed.`);
   markWriteCompleted();
   return data;

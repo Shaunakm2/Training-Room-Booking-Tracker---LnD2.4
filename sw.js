@@ -6,7 +6,7 @@
 
 // v4: bumped so any error responses cached by the pre-fix fetch handler are
 // discarded on activate. Bump this whenever the caching logic changes.
-const CACHE_NAME = 'ldrooms-shell-v5';
+const CACHE_NAME = 'ldrooms-shell-v6';
 // NOTE: root-level app.js no longer exists — the app is now ~24 ES modules
 // under js/. cache.addAll() rejects wholesale if ANY entry 404s, which would
 // silently abort service worker installation entirely, so app.js is removed

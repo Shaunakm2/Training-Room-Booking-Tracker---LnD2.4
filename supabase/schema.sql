@@ -25,14 +25,20 @@
 --    4. Row level security     10. Login rate limit
 --    5. Audit trail            11. Archive + reporting views
 --    6. Booking triggers       12. Privileges (every grant, in one place)
---                              13. Realtime + API reload
+--   10b. Admin idle timeout    13. Realtime + API reload
 --    Appendix A  Health checks          Appendix D  Accepted trade-offs
 --    Appendix B  Scheduled job          Appendix E  Self-test
 --    Appendix C  Maintenance
 --
 --  ADMIN IDENTITY.  The admin is the account whose email appears in
---  public.is_admin() (section 1). Keep it identical to ADMIN_EMAIL in
+--  public.is_admin_account() (section 1). Keep it identical to ADMIN_EMAIL in
 --  js/config.js — scripts/verify.mjs fails the build if they differ.
+--
+--  ADMIN IDLE TIMEOUT (section 10b).  is_admin() is true only for the admin
+--  account AND a session that has sent an activity heartbeat within
+--  admin_idle_limit() (12 min = the 10-min browser timeout + 2 min grace for
+--  heartbeat throttling). Enforced here, not just in the browser: an idle
+--  session cannot approve, edit or delete anything, whatever the client does.
 --
 --  CONFLICT OVERRIDE (used by sections 6 and 7).  A Confirmed booking may not
 --  overlap another Confirmed booking in the same room. The admin can still
@@ -105,15 +111,76 @@ begin
 end;
 $$;
 
--- Is the caller the admin? Checked inside every admin-only function and in
--- the admin RLS policies. Keep the email in step with js/config.js.
-create or replace function public.is_admin()
+-- Is the caller signed in as the admin ACCOUNT? Identity only — says nothing
+-- about whether the session is still active. Keep the email in step with
+-- js/config.js. Used by the session functions in section 10b; everything
+-- else uses is_admin() below.
+create or replace function public.is_admin_account()
 returns boolean
 language sql
 stable
 set search_path = public, pg_temp
 as $$
   select coalesce((auth.jwt() ->> 'email') = 'shaunakmistry4@gmail.com', false)
+$$;
+
+-- Server-side idle limit for admin sessions. ONE place. Must equal
+-- ADMIN_IDLE_TIMEOUT_MIN + 2 in js/config.js (verify.mjs checks): the extra
+-- 2 minutes cover the heartbeat throttle, so the server never expires a
+-- session the browser still considers active.
+create or replace function public.admin_idle_limit()
+returns interval
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select interval '12 minutes'
+$$;
+
+-- Supabase session id from the access token. Every sign-in creates a new
+-- session; token refreshes keep the same id. Null if absent or malformed.
+create or replace function public.jwt_session_id()
+returns uuid
+language plpgsql
+stable
+set search_path = public, pg_temp
+as $$
+begin
+  return nullif(auth.jwt() ->> 'session_id', '')::uuid;
+exception when others then
+  return null;
+end;
+$$;
+
+-- Is the caller the admin, in a session that is still ACTIVE? Checked inside
+-- every admin-only function and in the admin RLS policies.
+--   - admin account (is_admin_account), and
+--   - this session has an activity record (section 10b) that is not revoked
+--     and was touched within admin_idle_limit().
+-- A valid JWT is NOT enough: access tokens live for an hour and refresh
+-- tokens until revoked, so the token alone cannot express "idle for 12
+-- minutes". SECURITY DEFINER to read admin_session_activity, which no app
+-- role can read directly. plpgsql (not sql) so the body is not checked
+-- against tables that section 2 creates later in this file.
+create or replace function public.is_admin()
+returns boolean
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.is_admin_account() then
+    return false;
+  end if;
+  return exists (
+    select 1
+      from public.admin_session_activity a
+     where a.session_id = public.jwt_session_id()
+       and a.revoked_at is null
+       and a.last_seen > now() - public.admin_idle_limit()
+  );
+end;
 $$;
 
 -- Base-36 text -> bigint. Used only by the optional created_at backfill in
@@ -265,6 +332,20 @@ alter table public.bookings_archive
 alter table public.bookings_archive
   alter column created_at drop not null;
 
+-- 2.7 admin_session_activity — last real activity per admin sign-in session,
+--     for the server-side idle timeout (section 10b). One row per Supabase
+--     session. A revoked or stale row is kept as a tombstone, so that session
+--     can never be revived; tombstones are purged after 90 days.
+create table if not exists public.admin_session_activity (
+  session_id  uuid primary key,
+  user_id     uuid,
+  last_seen   timestamptz not null default now(),
+  created_at  timestamptz not null default now(),
+  revoked_at  timestamptz
+);
+create index if not exists admin_session_activity_last_seen_idx
+  on public.admin_session_activity (last_seen);
+
 
 -- ============================================================================
 -- 3. DATA RULES
@@ -360,6 +441,7 @@ alter table public.booking_idempotency enable row level security;
 alter table public.booking_rate_log    enable row level security;
 alter table public.login_attempt_log   enable row level security;
 alter table public.bookings_archive    enable row level security;
+alter table public.admin_session_activity enable row level security;
 
 drop policy if exists "Public can view bookings"           on public.bookings;
 drop policy if exists "Public sees only active bookings"   on public.bookings;
@@ -406,27 +488,29 @@ create policy "Public can create pending requests"
 -- nothing to Postgres, and these once read `using (true)`, which gave ANY
 -- signed-in account full control. Sign-ups are also disabled in the Supabase
 -- dashboard — two independent locks.
+-- `(select public.is_admin())` rather than a bare call: Postgres then runs it
+-- once per statement instead of once per row (is_admin() now reads a table).
 create policy "Admins can insert any booking"
   on public.bookings for insert
   to authenticated
-  with check (public.is_admin());
+  with check ((select public.is_admin()));
 
 create policy "Admins can update bookings"
   on public.bookings for update
   to authenticated
-  using (public.is_admin())
-  with check (public.is_admin());
+  using ((select public.is_admin()))
+  with check ((select public.is_admin()));
 
 create policy "Admins can delete bookings"
   on public.bookings for delete
   to authenticated
-  using (public.is_admin());
+  using ((select public.is_admin()));
 
 -- Only the admin can read the audit trail. Nobody can write to it directly.
 create policy "Admin can view booking audit"
   on public.booking_audit_log for select
   to authenticated
-  using (public.is_admin());
+  using ((select public.is_admin()));
 
 
 -- ============================================================================
@@ -1002,18 +1086,39 @@ as $$
 declare
   v_row public.bookings;
 begin
-  select * into v_row from public.bookings where booking_id = p_booking_id;
-
-  if not found then
-    return json_build_object('ok', false, 'error', 'Not found: ' || p_booking_id);
+  -- NULL-SAFE. `x <> NULL` is NULL, not TRUE, so an IF built on it never
+  -- fires: before this check, cancel_own_booking('<any id>', null) passed the
+  -- name check and cancelled ANY booking. Reject missing input first, and
+  -- compare with IS DISTINCT FROM, which treats NULL as a real value.
+  if p_booking_id is null or nullif(btrim(p_booker_name), '') is null then
+    return json_build_object('ok', false, 'error', 'Booking and name are required.');
   end if;
 
-  if lower(trim(v_row.booked_by)) <> lower(trim(p_booker_name)) then
+  -- FOR UPDATE: a cancel and a release of the same booking cannot interleave.
+  select * into v_row from public.bookings where booking_id = p_booking_id for update;
+
+  if not found then
+    return json_build_object('ok', false, 'error', 'Booking not found.');
+  end if;
+
+  if lower(btrim(v_row.booked_by)) is distinct from lower(btrim(p_booker_name)) then
     return json_build_object('ok', false, 'error', 'Name does not match booking.');
   end if;
 
-  if v_row.status = 'Cancelled' then
-    return json_build_object('ok', false, 'error', 'Booking already cancelled.');
+  -- Only live bookings. Cancelling a Rejected or already-Cancelled row would
+  -- rewrite history ("refused" becoming "withdrawn").
+  if v_row.status not in ('Pending', 'Confirmed') then
+    return json_build_object('ok', false,
+      'error', 'Only a pending or confirmed booking can be cancelled.');
+  end if;
+
+  -- Not after it has finished: that would erase used hours from utilisation
+  -- reporting. Compared in IST, the timezone the times are entered in.
+  if public.booking_end_ts(v_row.booking_date, v_row.start_time,
+                           v_row.end_time, v_row.end_date)
+     <= (now() at time zone 'Asia/Kolkata') then
+    return json_build_object('ok', false,
+      'error', 'This booking has already finished and cannot be cancelled.');
   end if;
 
   update public.bookings set status = 'Cancelled' where booking_id = p_booking_id;
@@ -1023,11 +1128,14 @@ end;
 $$;
 
 -- Release = end a running booking early. Guards:
+--   - every argument required (NULL arguments used to skip the checks below,
+--     because comparisons with NULL are never TRUE);
 --   - only Confirmed bookings;
 --   - may only SHORTEN (an earlier version let anyone extend any booking by
 --     a year with a single call);
 --   - the new end must be after the start: end <= start is read as an
---     overnight booking and would turn "release" into a 24-hour block.
+--     overnight booking and would turn "release" into a 24-hour block;
+--   - the new end cannot be in the past: release means "from now".
 create or replace function public.release_own_booking(
   p_booking_id  text,
   p_booker_name text,
@@ -1045,13 +1153,18 @@ declare
   v_old_end timestamp;
   v_new_end timestamp;
 begin
-  select * into v_row from public.bookings where booking_id = p_booking_id;
-
-  if not found then
-    return json_build_object('ok', false, 'error', 'Not found: ' || p_booking_id);
+  if p_booking_id is null or nullif(btrim(p_booker_name), '') is null
+     or p_end_time is null or p_end_date is null then
+    return json_build_object('ok', false, 'error', 'All release details are required.');
   end if;
 
-  if lower(trim(v_row.booked_by)) <> lower(trim(p_booker_name)) then
+  select * into v_row from public.bookings where booking_id = p_booking_id for update;
+
+  if not found then
+    return json_build_object('ok', false, 'error', 'Booking not found.');
+  end if;
+
+  if lower(btrim(v_row.booked_by)) is distinct from lower(btrim(p_booker_name)) then
     return json_build_object('ok', false, 'error', 'Name does not match booking.');
   end if;
 
@@ -1060,7 +1173,8 @@ begin
   end if;
 
   v_start   := v_row.booking_date + v_row.start_time;
-  v_old_end := coalesce(v_row.end_date, v_row.booking_date) + v_row.end_time;
+  v_old_end := public.booking_end_ts(v_row.booking_date, v_row.start_time,
+                                     v_row.end_time, v_row.end_date);
   v_new_end := p_end_date + p_end_time;
 
   if v_new_end > v_old_end then
@@ -1069,6 +1183,11 @@ begin
 
   if v_new_end <= v_start then
     return json_build_object('ok', false, 'error', 'Release time is at or before the booking start — cancel it instead.');
+  end if;
+
+  -- 5 minutes' grace for a slow device clock or a form left open briefly.
+  if v_new_end < (now() at time zone 'Asia/Kolkata') - interval '5 minutes' then
+    return json_build_object('ok', false, 'error', 'Release time cannot be in the past.');
   end if;
 
   update public.bookings
@@ -1154,6 +1273,157 @@ set search_path = public, pg_temp
 as $$
 begin
   insert into public.login_attempt_log (ip) values (public.client_ip());
+end;
+$$;
+
+
+-- ============================================================================
+-- 10b. ADMIN IDLE TIMEOUT (server-side)
+-- ============================================================================
+-- The browser signs the admin out after 10 minutes without activity, but a
+-- browser timer is advice, not enforcement: the Supabase session is a JWT
+-- plus a refresh token in localStorage, and on its own the server would
+-- honour it indefinitely. These functions make the server enforce it too.
+--
+--   Browser                          Server
+--   real activity (click/key/...) -> admin_heartbeat()  at most once a minute
+--   background refresh            -> nothing (does not count as activity)
+--   10 min idle                   -> admin_end_session(), then sign-out
+--   12 min idle (any reason)      -> is_admin() = false: every admin write
+--                                    and admin RLS policy refuses the session
+--   stale session seen again      -> revoked: refresh token deleted
+--
+-- Revocation deletes the session from auth.sessions (Supabase's own table;
+-- its refresh tokens go with it). If this project's database role may not
+-- delete there, the delete is skipped with a NOTICE — is_admin() still
+-- refuses the session, so it remains powerless, only its token survives
+-- until Supabase expires it. Appendix B has an optional job that revokes
+-- sessions abandoned with the browser closed.
+
+-- Revoke one admin session: tombstone the activity row (permanent) and
+-- delete the Supabase session so its refresh token stops working.
+create or replace function public.revoke_admin_session(p_session_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if p_session_id is null then
+    return;
+  end if;
+  insert into public.admin_session_activity (session_id, last_seen, revoked_at)
+  values (p_session_id, now(), now())
+  on conflict (session_id) do update
+    set revoked_at = coalesce(public.admin_session_activity.revoked_at, now());
+  begin
+    delete from auth.sessions where id = p_session_id;
+  exception when others then
+    raise notice 'Admin session % tombstoned but not deleted from auth.sessions (%). is_admin() refuses it regardless.',
+      p_session_id, sqlerrm;
+  end;
+end;
+$$;
+
+-- Called by the browser on real user activity (throttled to once a minute)
+-- and right after sign-in. Returns {ok:true} or {ok:false, expired:true}.
+--   - An existing session is extended only if it is still within the limit:
+--     the first click after an overnight absence must END the session, not
+--     revive it (the same race the browser guards against in js/app.js).
+--   - A session with no record yet may start one only with a token issued in
+--     the last 2 minutes, i.e. a fresh sign-in. An old token cannot start
+--     the clock afresh.
+create or replace function public.admin_heartbeat()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_sid uuid := public.jwt_session_id();
+  v_row public.admin_session_activity;
+  v_iat bigint;
+begin
+  if auth.role() is distinct from 'authenticated' or not public.is_admin_account() then
+    raise exception 'Admin access required.' using errcode = '42501';
+  end if;
+  if v_sid is null then
+    raise exception 'Sign-in token has no session id.' using errcode = '42501';
+  end if;
+
+  select * into v_row from public.admin_session_activity
+   where session_id = v_sid for update;
+
+  if found then
+    if v_row.revoked_at is not null
+       or v_row.last_seen <= now() - public.admin_idle_limit() then
+      perform public.revoke_admin_session(v_sid);
+      return jsonb_build_object('ok', false, 'expired', true);
+    end if;
+    update public.admin_session_activity set last_seen = now()
+     where session_id = v_sid;
+    return jsonb_build_object('ok', true);
+  end if;
+
+  begin
+    v_iat := (auth.jwt() ->> 'iat')::bigint;
+  exception when others then
+    v_iat := null;
+  end;
+  if v_iat is null or v_iat < extract(epoch from now())::bigint - 120 then
+    perform public.revoke_admin_session(v_sid);
+    return jsonb_build_object('ok', false, 'expired', true);
+  end if;
+
+  insert into public.admin_session_activity (session_id, user_id)
+  values (v_sid, auth.uid());
+  return jsonb_build_object('ok', true);
+end;
+$$;
+
+-- Called by the browser on logout and on idle timeout, BEFORE signing out,
+-- so the session loses admin rights at the server immediately (sign-out
+-- alone leaves the access token usable until it expires, up to an hour).
+-- Only ever ends the caller's own session.
+create or replace function public.admin_end_session()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if auth.role() is distinct from 'authenticated' or not public.is_admin_account() then
+    raise exception 'Admin access required.' using errcode = '42501';
+  end if;
+  perform public.revoke_admin_session(public.jwt_session_id());
+  return jsonb_build_object('ok', true);
+end;
+$$;
+
+-- Optional scheduled job (Appendix B): revoke admin sessions abandoned with
+-- the browser closed — nothing else would ever look at them again — and
+-- purge tombstones older than 90 days. Returns the number revoked.
+create or replace function public.expire_idle_admin_sessions()
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  r record;
+  v_count integer := 0;
+begin
+  for r in
+    select session_id from public.admin_session_activity
+     where revoked_at is null
+       and last_seen <= now() - public.admin_idle_limit()
+  loop
+    perform public.revoke_admin_session(r.session_id);
+    v_count := v_count + 1;
+  end loop;
+  delete from public.admin_session_activity
+   where coalesce(revoked_at, last_seen) < now() - interval '90 days';
+  return v_count;
 end;
 $$;
 
@@ -1265,16 +1535,26 @@ comment on view public.room_utilisation_monthly is
 --   anon (public visitors)   authenticated (the admin)
 --   ----------------------   -------------------------------------------
 --   create_bookings_atomic   everything anon has, plus the admin RPCs,
---   cancel_own_booking       is_admin(), and read access to the audit log
+--   cancel_own_booking       is_admin(), admin_heartbeat(),
+--                            admin_end_session(), read access to the audit log
 --   release_own_booking
 --   bookings_change_marker   service_role: archive_old_bookings (scheduled job)
 --   check_login_rate_limit
 --   log_failed_login
 --
--- The bookings table itself keeps Supabase's default grants; RLS (section 4)
--- decides what each role may do with it.
+-- bookings: anon may only READ it directly (the public board). Every write
+-- goes through the SECURITY DEFINER functions in sections 7-8, which run as
+-- the owner and need no grant. Removing direct INSERT/UPDATE/DELETE closes
+-- whatever the RLS write policies might miss (e.g. a forged created_at,
+-- which pinned a row to the top of "Recently added"), and TRUNCATE, which
+-- RLS does not govern at all. The admin keeps direct UPDATE for one call:
+-- apiSetConflictResolved in js/api/bookings.js (still RLS-gated to is_admin()).
 
 -- 12.1 Tables and views: no direct access for app roles.
+revoke insert, update, delete, truncate on public.bookings from public, anon;
+revoke insert, delete, truncate on public.bookings from authenticated;
+grant select on public.bookings to anon, authenticated;
+grant update on public.bookings to authenticated;
 revoke all on public.booking_audit_log from public, anon, authenticated;
 revoke all on public.booking_idempotency from public, anon, authenticated;
 revoke all on public.booking_rate_log from public, anon, authenticated;
@@ -1282,6 +1562,7 @@ revoke all on public.login_attempt_log from public, anon, authenticated;
 revoke all on public.bookings_archive from public, anon, authenticated;
 revoke all on public.bookings_all from public, anon, authenticated;
 revoke all on public.room_utilisation_monthly from public, anon, authenticated;
+revoke all on public.admin_session_activity from public, anon, authenticated;
 -- The admin may read the audit trail (row access still limited by RLS).
 grant select on public.booking_audit_log to authenticated;
 
@@ -1296,6 +1577,10 @@ revoke all on function public.audit_log_is_append_only()                   from 
 revoke all on function public.enforce_room_capacity()                      from public, anon, authenticated;
 revoke all on function public.enforce_no_confirmed_overlap()               from public, anon, authenticated;
 revoke all on function public.enforce_booking_rate_limit()                 from public, anon, authenticated;
+revoke all on function public.is_admin_account()                           from public, anon, authenticated;
+revoke all on function public.admin_idle_limit()                           from public, anon, authenticated;
+revoke all on function public.jwt_session_id()                             from public, anon, authenticated;
+revoke all on function public.revoke_admin_session(uuid)                   from public, anon, authenticated;
 
 -- 12.3 is_admin(): evaluated by the admin RLS policies as the caller.
 revoke all on function public.is_admin()                                   from public, anon, authenticated;
@@ -1326,10 +1611,18 @@ grant execute on function public.update_booking_statuses_atomic(text[], text, bo
 grant execute on function public.approve_bookings_atomic(jsonb)                       to authenticated;
 grant execute on function public.delete_bookings_atomic(text[])                       to authenticated;
 grant execute on function public.replace_booking_atomic(text, jsonb, text)            to authenticated;
+-- Session functions: authenticated only; each checks the admin account inside
+-- and only ever acts on the caller's own session.
+revoke all on function public.admin_heartbeat()                                    from public, anon, authenticated;
+revoke all on function public.admin_end_session()                                  from public, anon, authenticated;
+grant execute on function public.admin_heartbeat()                                    to authenticated;
+grant execute on function public.admin_end_session()                                  to authenticated;
 
 -- 12.6 Scheduled job only. It deletes from bookings and bypasses RLS.
 revoke all on function public.archive_old_bookings(integer)                from public, anon, authenticated;
 grant execute on function public.archive_old_bookings(integer)             to service_role;
+revoke all on function public.expire_idle_admin_sessions()                 from public, anon, authenticated;
+grant execute on function public.expire_idle_admin_sessions()              to service_role;
 
 
 -- ============================================================================
@@ -1422,6 +1715,13 @@ notify pgrst, 'reload schema';
 --   join pg_namespace n on n.oid = c.relnamespace
 --   where n.nspname = 'public' and c.relkind = 'v';
 --
+-- A9. Admin sessions (expect your current session with a recent last_seen;
+--     stale rows should have revoked_at set if the Appendix B job runs):
+--   select session_id, last_seen, revoked_at,
+--          now() - last_seen as idle_for
+--     from public.admin_session_activity
+--    order by last_seen desc limit 10;
+--
 -- A8. Latest booking activity (expect rows — this is the audit trail):
 --
 --   select occurred_at, action, booking_id, actor_role, actor_email, client_ip,
@@ -1455,6 +1755,15 @@ notify pgrst, 'reload schema';
 --   order by start_time desc limit 5;
 -- Remove:
 --   select cron.unschedule('archive-old-bookings-daily');
+--
+-- OPTIONAL second job — revoke abandoned admin sessions (section 10b):
+--   Job name : expire-idle-admin-sessions
+--   Schedule : */5 * * * *   (every 5 minutes)
+--   Command  : select public.expire_idle_admin_sessions()
+-- Without it the timeout is still enforced (is_admin() refuses idle
+-- sessions); this only deletes their refresh tokens sooner.
+--   select cron.schedule('expire-idle-admin-sessions', '*/5 * * * *',
+--                        'select public.expire_idle_admin_sessions()');
 
 
 -- ============================================================================
@@ -1527,7 +1836,7 @@ notify pgrst, 'reload schema';
 --
 -- It ALWAYS ends with an error, on purpose — ending with an error is what
 -- rolls back every test row. Read the message:
---   "SELFTEST PASSED: 23 checks ..."  -> everything works.
+--   "SELFTEST PASSED: 25 checks ..."  -> everything works.
 --   "SELFTEST FAILED [Tn]: ..."       -> that check failed.
 -- Uses room 'vedvyas' ten years ahead, so real bookings are never touched.
 /*
@@ -1536,8 +1845,10 @@ do $$
 declare
   c_admin  constant text := json_build_object(
              'role','authenticated',
-             'email','shaunakmistry4@gmail.com',   -- must equal is_admin()
-             'sub','00000000-0000-0000-0000-00000000a001')::text;
+             'email','shaunakmistry4@gmail.com',   -- must equal is_admin_account()
+             'sub','00000000-0000-0000-0000-00000000a001',
+             'session_id','00000000-0000-0000-0000-00000000a5e1')::text;
+  c_sid    constant uuid := '00000000-0000-0000-0000-00000000a5e1';
   c_anon   constant text := json_build_object('role','anon')::text;
   d        date := current_date + 3650;
   v_pass   integer := 0;
@@ -1546,6 +1857,11 @@ declare
   v_status text;
   v_end    time;
 begin
+  -- Active session record for the test admin (rolled back at the end).
+  insert into public.admin_session_activity (session_id, last_seen)
+  values (c_sid, now())
+  on conflict (session_id) do update set last_seen = now(), revoked_at = null;
+
   -- T0 ---------------------------------------------------------------
   perform set_config('request.jwt.claims', c_admin, true);
   if not public.is_admin() then
@@ -1796,6 +2112,29 @@ begin
   perform public.update_booking_statuses_atomic(array['zzstR1'], 'Cancelled', false);
   if public.bookings_change_marker() = v_res then
     raise exception 'SELFTEST FAILED [T22]: change marker did not move after a change' using errcode='ZZ001';
+  end if;
+  v_pass := v_pass + 1;
+
+  -- T23 server-side idle timeout: a session idle past the limit is not admin --
+  perform set_config('request.jwt.claims', c_admin, true);
+  update public.admin_session_activity
+     set last_seen = now() - public.admin_idle_limit() - interval '1 minute'
+   where session_id = c_sid;
+  if public.is_admin() then
+    raise exception 'SELFTEST FAILED [T23]: idle admin session still treated as admin' using errcode='ZZ001';
+  end if;
+  begin
+    perform public.update_booking_statuses_atomic(array['zzstR1'], 'Confirmed', false);
+    raise exception 'SELFTEST FAILED [T23]: idle admin session could still write' using errcode='ZZ001';
+  exception when sqlstate '42501' then null;
+  end;
+  v_pass := v_pass + 1;
+
+  -- T24 heartbeat cannot revive a stale session; it revokes it ------------
+  v_res := public.admin_heartbeat();
+  if coalesce((v_res ->> 'ok')::boolean, true)
+     or (select revoked_at from public.admin_session_activity where session_id = c_sid) is null then
+    raise exception 'SELFTEST FAILED [T24]: heartbeat revived or did not revoke a stale session: %', v_res using errcode='ZZ001';
   end if;
   v_pass := v_pass + 1;
 

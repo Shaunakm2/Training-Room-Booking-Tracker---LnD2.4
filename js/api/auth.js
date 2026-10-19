@@ -10,9 +10,39 @@ import { ADMIN_EMAIL } from '../config.js';
 import {
   adminLoggedIn,
   loginAttempts, setLoginAttempts, loginLockedUntil, setLoginLockedUntil,
-  MAX_LOGIN_ATTEMPTS, LOCKOUT_MS, setLastActivityAt,
+  MAX_LOGIN_ATTEMPTS, LOCKOUT_MS,
   setAdminLoggedIn
 } from '../state.js';
+
+// Shared last-activity stamp (all tabs). Owned here; js/app.js imports it.
+export const ACTIVITY_KEY = 'ldrooms-last-activity';
+
+// ---- Server-side session (schema.sql section 10b) ----
+// The browser timer alone is advice: the Supabase session survives in
+// localStorage and the server would honour it. These calls make the server
+// track real activity and refuse an idle session (is_admin() = false).
+
+// Report real user activity. Returns 'ok', 'expired' (the server has ended
+// this session: sign out now) or 'error' (network etc.: keep going, the next
+// activity retries; the server still enforces the limit on its own).
+export async function adminHeartbeat() {
+  try {
+    const { data, error } = await supabase.rpc('admin_heartbeat');
+    if (error) return error.code === '42501' ? 'expired' : 'error';
+    return data && data.ok === true ? 'ok' : 'expired';
+  } catch (_) {
+    return 'error';
+  }
+}
+
+// End the session at the server, then locally. scope 'local' signs out THIS
+// browser only: the admin account is shared, and the SDK default ('global')
+// would sign out every other device using it too.
+async function endAdminSession() {
+  try { await supabase.rpc('admin_end_session'); } catch (_) { /* server still expires it on its own */ }
+  try { await supabase.auth.signOut({ scope: 'local' }); } catch (_) { /* clear local state regardless */ }
+  try { localStorage.removeItem(ACTIVITY_KEY); } catch (_) {}
+}
 import { toast, showLoadingOverlay } from '../utils/dom-helpers.js';
 import { showPage } from '../ui/pages.js'; // see note above
 
@@ -40,7 +70,6 @@ export async function restoreSession() {
     // (or a stale session from a different project) is ignored.
     if ((session.user?.email || '').toLowerCase() !== ADMIN_EMAIL.toLowerCase()) return false;
     setAdminLoggedIn(true);
-    setLastActivityAt(Date.now());
     const btn = document.getElementById('logout-btn');
     if (btn) btn.style.display = '';
     return true;
@@ -55,16 +84,16 @@ export async function restoreSession() {
 // persisted session survives and restoreSession() would hand the panel
 // straight back on the next refresh, defeating the timeout entirely.
 export async function expireSession() {
-  try { await supabase.auth.signOut(); } catch (e) { /* clear local state regardless */ }
   setAdminLoggedIn(false);
+  await endAdminSession();
 }
 
 export async function doLogout() {
-  await supabase.auth.signOut();
   setAdminLoggedIn(false);
-  // Clear the persisted idle-timer stamp too, so a later page load doesn't
-  // evaluate a stale timestamp against a fresh session.
-  try { localStorage.removeItem('ldrooms-last-activity'); } catch (_) {}
+  // Ends the session at the server first, then signs this browser out, and
+  // clears the idle-timer stamp so a later page load doesn't evaluate a
+  // stale timestamp against a fresh session.
+  await endAdminSession();
   // Refetch as anon for the same reason as in doLogin: otherwise the browser
   // keeps showing admin-visible rows (rejected, cancelled) after sign-out
   // until the next page load.
@@ -116,12 +145,23 @@ export async function doLogin() {
     showLoadingOverlay(true);
     const { data, error } = await supabase.auth.signInWithPassword({ email: ADMIN_EMAIL, password: pw });
     if (!error && data.session) {
+      // Start the server-side activity clock BEFORE treating the admin as
+      // signed in. Without it the server refuses every admin action, so a
+      // failure here must stop the login, not leave a panel that cannot save.
+      const hb = await adminHeartbeat();
+      if (hb !== 'ok') {
+        try { await supabase.auth.signOut({ scope: 'local' }); } catch (_) {}
+        document.getElementById('login-error').textContent = hb === 'error'
+          ? 'Signed in, but the server could not start an admin session. Check your connection and try again.'
+          : 'The server refused to start an admin session. Please try again.';
+        document.getElementById('login-error').classList.add('visible');
+        return;
+      }
       setLoginAttempts(0);
       setLoginLockedUntil(0);
-      setLastActivityAt(Date.now());
-      // app.js keeps its own idle clock in localStorage. Stamp it now so the
+      // app.js keeps its idle clock in localStorage. Stamp it now so the
       // session isn't judged against a timestamp from a previous session.
-      try { localStorage.setItem('ldrooms-last-activity', String(Date.now())); } catch (_) {}
+      try { localStorage.setItem(ACTIVITY_KEY, String(Date.now())); } catch (_) {}
       setAdminLoggedIn(true);
       document.getElementById('logout-btn').style.display = '';
       document.getElementById('login-modal').style.display = 'none';

@@ -13,7 +13,8 @@ import { bookings, adminLoggedIn } from './state.js';
 import { todayStr } from './domain/time.js';
 import { toast, updateClock } from './utils/dom-helpers.js';
 import { loadData, refreshIfChanged } from './api/supabase-client.js';
-import { doLogin, doLogout, closeLogin, requireAdmin, restoreSession, expireSession } from './api/auth.js';
+import { doLogin, doLogout, closeLogin, requireAdmin, restoreSession, expireSession, adminHeartbeat, ACTIVITY_KEY } from './api/auth.js';
+import { ADMIN_IDLE_TIMEOUT_MIN, ADMIN_IDLE_WARNING_MIN, ADMIN_HEARTBEAT_SEC } from './config.js';
 import { notifyTeams } from './api/notifications.js';
 
 import { showPage } from './ui/pages.js';
@@ -156,13 +157,20 @@ Object.assign(window, {
 });
 
 // ============================================================
-// Session timeout (10 min inactivity, 2 min warning) — needs
-// showPage/toast/state setters together, kept here rather than in
-// state.js to avoid a circular import.
+// Admin idle timeout — configured in js/config.js (ADMIN_IDLE_*).
+// Kept here rather than in state.js because it needs showPage/toast and the
+// state setters together, which would create a circular import.
 //
-// NOTE: state.js also declares SESSION_TIMEOUT_MS / lastActivityAt. Those
-// copies are DEAD — this file uses its own. Changing the values there does
-// nothing. Change them HERE.
+// TWO LAYERS
+//   Browser (this file): signs out after ADMIN_IDLE_TIMEOUT_MIN without
+//     activity, warns ADMIN_IDLE_WARNING_MIN before. Clicks, keys, scroll,
+//     mouse move and touch count; the clock is shared across tabs.
+//   Server (schema.sql section 10b): real activity is reported with
+//     admin_heartbeat() at most every ADMIN_HEARTBEAT_SEC. is_admin() refuses
+//     any session not heard from within the server limit (timeout + 2 min),
+//     so the timeout holds even if this code is bypassed, the tab is frozen,
+//     or the token is copied elsewhere. Background refreshes do NOT send
+//     heartbeats — only a person using the page keeps the session alive.
 //
 // The last-activity timestamp is mirrored into localStorage because the
 // setInterval below only runs while a tab is open. Without persistence the
@@ -171,12 +179,14 @@ Object.assign(window, {
 // session actually happens. Closing the browser overnight and returning to a
 // live admin panel was the symptom.
 // ============================================================
-const SESSION_TIMEOUT_MS = 10 * 60 * 1000;
-const SESSION_WARNING_MS = 2 * 60 * 1000;
-const ACTIVITY_KEY = 'ldrooms-last-activity';
-let _lastActivityAt = Date.now();
+const SESSION_TIMEOUT_MS = ADMIN_IDLE_TIMEOUT_MIN * 60 * 1000;
+const SESSION_WARNING_MS = ADMIN_IDLE_WARNING_MIN * 60 * 1000;
+const HEARTBEAT_MS = ADMIN_HEARTBEAT_SEC * 1000;
+let _lastActivityAt = 0;      // set from storage at startup / on activity
 let _sessionWarningShown = false;
 let _lastTouchWrite = 0;
+let _lastHeartbeatAt = 0;
+let _ending = false;
 
 // Last activity across ALL tabs. _lastActivityAt is per-tab; the localStorage
 // stamp is shared. Taking the max stops a second tab that has been sitting
@@ -185,6 +195,15 @@ function _lastActivitySeen() {
   let stored = 0;
   try { stored = Number(localStorage.getItem(ACTIVITY_KEY)) || 0; } catch (_) {}
   return Math.max(_lastActivityAt || 0, stored);
+}
+
+// Report activity to the server, throttled. Fire-and-forget: only an
+// explicit 'expired' ends the session; a network blip is retried on the
+// next activity (and the server enforces the limit regardless).
+function _maybeHeartbeat(now) {
+  if (!adminLoggedIn || now - _lastHeartbeatAt < HEARTBEAT_MS) return;
+  _lastHeartbeatAt = now;
+  adminHeartbeat().then(r => { if (r === 'expired') _endSession(); });
 }
 
 function _touchActivity() {
@@ -214,6 +233,7 @@ function _touchActivity() {
   _lastActivityAt = now;
   _sessionWarningShown = false;
   try { localStorage.setItem(ACTIVITY_KEY, String(now)); } catch (_) {}
+  _maybeHeartbeat(now);
 }
 
 // scroll and mousemove count as activity: at 10 minutes, someone reading a
@@ -223,19 +243,40 @@ function _touchActivity() {
   ev => document.addEventListener(ev, _touchActivity, { passive: true })
 );
 
-function _endSession() {
-  // expireSession() signs out at the Supabase level too. Clearing only the
-  // in-memory flags would leave the persisted session intact, and the
-  // restoreSession() call in init() would then log the admin straight back
-  // in on the next refresh — silently cancelling the idle timeout.
-  expireSession();
-  _sessionWarningShown = false;
-  try { localStorage.removeItem(ACTIVITY_KEY); } catch (_) {}
-  const logoutBtn = document.getElementById('logout-btn');
-  if (logoutBtn) logoutBtn.style.display = 'none';
-  showPage('status');
-  toast('Session expired. Please log in again.');
+async function _endSession() {
+  if (_ending) return;           // several triggers can fire together
+  _ending = true;
+  try {
+    // expireSession() ends the session at the SERVER (admin_end_session),
+    // then signs this browser out. Clearing only the in-memory flags would
+    // leave the persisted session intact, and restoreSession() in init()
+    // would log the admin straight back in on the next refresh.
+    await expireSession();
+    // Reload as anon: the admin view includes Rejected/Cancelled rows that
+    // the public must not keep seeing on this screen after sign-out.
+    try { await loadData(); } catch (_) {}
+    window.dispatchEvent(new CustomEvent('ldrooms:data-refreshed'));
+  } finally {
+    _sessionWarningShown = false;
+    _lastHeartbeatAt = 0;
+    const logoutBtn = document.getElementById('logout-btn');
+    if (logoutBtn) logoutBtn.style.display = 'none';
+    showPage('status');
+    toast('Session expired. Please log in again.');
+    _ending = false;
+  }
 }
+
+// The server refused an admin call (session ended there: idle limit, or
+// signed out on another tab). Sign this browser out too.
+window.addEventListener('ldrooms:admin-session-invalid', () => {
+  if (adminLoggedIn) _endSession();
+});
+
+// Another tab logged out or timed out: it removed the shared stamp.
+window.addEventListener('storage', e => {
+  if (e.key === ACTIVITY_KEY && e.newValue === null && adminLoggedIn) _endSession();
+});
 
 setInterval(() => {
   if (!adminLoggedIn) return;
@@ -244,9 +285,31 @@ setInterval(() => {
     _endSession();
   } else if (idleFor > SESSION_TIMEOUT_MS - SESSION_WARNING_MS && !_sessionWarningShown) {
     _sessionWarningShown = true;
-    toast('Your session will expire in 2 minutes due to inactivity — click anywhere to stay logged in.', false, 7000);
+    toast(`Your session will expire in ${ADMIN_IDLE_WARNING_MIN} minutes due to inactivity — click anywhere to stay logged in.`, false, 7000);
   }
 }, 15000);
+
+// Decide, BEFORE any admin screen is shown, whether a session restored from
+// storage may continue. Fails CLOSED: no activity stamp (storage cleared,
+// first run after an upgrade) is treated as stale, and the server must agree
+// the session is still live.
+async function _resumeAdminSessionIfFresh() {
+  if (!(await restoreSession())) return false;
+  let stored = 0;
+  try { stored = Number(localStorage.getItem(ACTIVITY_KEY)) || 0; } catch (_) {}
+  if (!stored || Date.now() - stored > SESSION_TIMEOUT_MS) {
+    await _endSession();
+    return false;
+  }
+  _lastActivityAt = stored;
+  const hb = await adminHeartbeat();
+  if (hb === 'expired') {
+    await _endSession();
+    return false;
+  }
+  _lastHeartbeatAt = Date.now();
+  return true;
+}
 
 window.addEventListener('beforeunload', e => {
   const booker = document.getElementById('f-booker')?.value;
@@ -260,20 +323,11 @@ window.addEventListener('beforeunload', e => {
 // INIT
 // ============================================================
 async function init() {
-  // Before anything else: if a valid admin session survived the reload,
-  // pick it back up so a refresh doesn't appear to log the admin out.
-  if (await restoreSession()) showPage('admin');
-
-  // ...but only if it has not gone stale while the browser was closed. This
-  // must run AFTER restoreSession(), since it depends on adminLoggedIn.
-  try {
-    const stored = Number(localStorage.getItem(ACTIVITY_KEY)) || 0;
-    if (stored && adminLoggedIn && Date.now() - stored > SESSION_TIMEOUT_MS) {
-      _endSession();
-    } else if (stored) {
-      _lastActivityAt = stored;
-    }
-  } catch (_) {}
+  // Before anything else: if an admin session survived the reload and is
+  // still fresh (browser stamp AND server agree), pick it back up so a
+  // refresh doesn't log the admin out. Checked BEFORE showing the admin page,
+  // so a stale session never flashes the panel.
+  if (await _resumeAdminSessionIfFresh()) showPage('admin');
 
   populateRoomSelects();
   document.getElementById('f-date').value = todayStr();

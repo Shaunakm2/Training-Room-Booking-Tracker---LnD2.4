@@ -787,6 +787,52 @@ function stripNoise(src) {
       : ok('background refresh only downloads on change');
   }
 
+  // Public self-service functions must be NULL-safe. `x <> NULL` is NULL, so a
+  // name check written with <> silently passes when the caller sends null —
+  // that let anyone cancel any booking. Require an explicit NULL guard and
+  // IS DISTINCT FROM for the name comparison.
+  {
+    const problems = [];
+    for (const fn of ['cancel_own_booking', 'release_own_booking']) {
+      const body = (fnBody(fn) || '').toLowerCase();
+      if (!body) { problems.push(`${fn} missing`); continue; }
+      if (!/p_booker_name\)\s*,\s*''\)\s+is\s+null/.test(body)) problems.push(`${fn}: no NULL/blank name guard`);
+      if (!/is\s+distinct\s+from\s+lower\(btrim\(p_booker_name\)\)/.test(body)) problems.push(`${fn}: name compared with <> (NULL-unsafe)`);
+    }
+    const rel = (fnBody('release_own_booking') || '').toLowerCase();
+    if (!/p_end_time\s+is\s+null\s+or\s+p_end_date\s+is\s+null/.test(rel)) problems.push('release_own_booking: no NULL guard on end time/date');
+    if (!/status\s+not\s+in\s+\('pending',\s*'confirmed'\)/.test(fnBody('cancel_own_booking').toLowerCase())) problems.push('cancel_own_booking: can cancel Rejected/Cancelled rows');
+    if (!/revoke\s+insert,\s*update,\s*delete,\s*truncate\s+on\s+public\.bookings\s+from\s+public,\s*anon/i.test(sql)) problems.push('anon still has direct write access to bookings');
+    problems.length
+      ? fail('public self-service is NULL-safe', problems.join('; '))
+      : ok('public self-service is NULL-safe');
+  }
+
+  // Admin idle timeout: one configured value, enforced by the server too.
+  {
+    const problems = [];
+    const cfgSrc = read('js/config.js');
+    const appSrc = stripComments(read('js/app.js'));
+    const authSrc = stripComments(read('js/api/auth.js'));
+    const stateSrc = stripComments(read('js/state.js'));
+    const cfgMin = Number((cfgSrc.match(/ADMIN_IDLE_TIMEOUT_MIN\s*=\s*(\d+)/) || [])[1]);
+    const srvMin = Number((sql.match(/function public\.admin_idle_limit\(\)[\s\S]*?interval '(\d+) minutes'/i) || [])[1]);
+    if (!cfgMin) problems.push('ADMIN_IDLE_TIMEOUT_MIN missing from config.js');
+    if (!srvMin) problems.push('admin_idle_limit() missing from schema');
+    if (cfgMin && srvMin && srvMin !== cfgMin + 2) problems.push(`server limit ${srvMin} min must be config ${cfgMin} + 2`);
+    if (/SESSION_TIMEOUT_MS\s*=\s*\d/.test(appSrc)) problems.push('app.js hard-codes the timeout instead of reading config.js');
+    if (/SESSION_TIMEOUT_MS|lastActivityAt/.test(stateSrc)) problems.push('dead session constants back in state.js');
+    if (!/admin_session_activity/.test(fnBody('is_admin') || '')) problems.push('is_admin() does not check session activity');
+    if (!/rpc\('admin_heartbeat'\)/.test(authSrc)) problems.push('client never sends admin_heartbeat');
+    if (!/rpc\('admin_end_session'\)/.test(authSrc)) problems.push('logout/timeout does not end the session at the server');
+    if (/auth\.signOut\(\s*\)/.test(authSrc)) problems.push("signOut() without { scope: 'local' } signs out every device on the shared admin account");
+    if (!/_resumeAdminSessionIfFresh\(\)\)\s*showPage\('admin'\)/.test(appSrc)) problems.push('admin page shown before the restored session is checked');
+    if (/grant\s+execute\s+on\s+function\s+public\.admin_heartbeat\(\)\s+to\s+[^;]*anon/i.test(sql)) problems.push('admin_heartbeat granted to anon');
+    problems.length
+      ? fail('admin idle timeout enforced server-side', problems.join('; '))
+      : ok('admin idle timeout enforced server-side', `${cfgMin} min (server ${srvMin})`);
+  }
+
   // Pre-flight refresh must FAIL CLOSED: deciding on stale data is the bug.
   {
     const bad = ['js/ui/request-form.js', 'js/ui/admin-table.js']

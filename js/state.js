@@ -65,10 +65,6 @@ export function setLoginLockedUntil(v) { loginLockedUntil = v; }
 export const MAX_LOGIN_ATTEMPTS = 5;
 export const LOCKOUT_MS = 5 * 60 * 1000; // 5 minutes
 
-// Session timeout — 30 min inactivity
-export const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
-export const SESSION_WARNING_MS = 5 * 60 * 1000; // warn 5 min before actual timeout
-export let lastActivityAt = Date.now();
-export function setLastActivityAt(v) { lastActivityAt = v; }
-export let sessionWarningShown = false;
-export function setSessionWarningShown(v) { sessionWarningShown = v; }
+// The admin idle timeout lives in js/app.js, configured in js/config.js
+// (ADMIN_IDLE_TIMEOUT_MIN). A second, unused copy used to sit here (30 min)
+// and misled anyone who changed it; it was removed.

@@ -26,7 +26,7 @@ function writeRecentlyCompleted() {
 // ---- Change marker ----
 // The 60-second poll and every tab focus used to download the WHOLE bookings
 // table, even when nothing had changed. bookings_change_marker() (schema.sql
-// section 14h) returns two small counters that move on every booking change.
+// section 9) returns two small counters that move on every booking change.
 // Background refreshes ask for it first and download bookings only when it
 // differs from the value seen at the last full load.
 //

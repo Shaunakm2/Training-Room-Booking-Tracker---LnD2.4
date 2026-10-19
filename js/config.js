@@ -27,6 +27,17 @@ export const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable__-SxyNxa9RJAZyW81_a27A_O
 // policies in Supabase, not from hiding this string. See supabase/schema.sql.
 export const ADMIN_EMAIL = 'shaunakmistry4@gmail.com';
 
+// Admin idle timeout — the ONLY place to change it.
+//   ADMIN_IDLE_TIMEOUT_MIN  minutes without activity before sign-out.
+//   ADMIN_IDLE_WARNING_MIN  warning toast shown this long before sign-out.
+//   ADMIN_HEARTBEAT_SEC     activity reported to the server at most this often.
+// The server enforces the timeout too: admin_idle_limit() in
+// supabase/schema.sql must equal ADMIN_IDLE_TIMEOUT_MIN + 2 (the 2 minutes
+// cover the heartbeat throttle). scripts/verify.mjs fails if they differ.
+export const ADMIN_IDLE_TIMEOUT_MIN = 10;
+export const ADMIN_IDLE_WARNING_MIN = 2;
+export const ADMIN_HEARTBEAT_SEC = 60;
+
 export const TEAMS_NOTIFY_URL = 'https://xgrwmwibfkuxzkuuidsh.supabase.co/functions/v1/teams-notify';
 
 export const PAGE_SIZE = 15; // bookings per page in admin table
